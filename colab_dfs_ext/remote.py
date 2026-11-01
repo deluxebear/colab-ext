@@ -12,6 +12,7 @@ import re
 import subprocess
 import sys
 import tempfile
+import time
 
 ANSI = re.compile(r"\x1b\[[0-9;]*m")
 
@@ -48,7 +49,50 @@ def render(snippet: str, mountpoint: str) -> str:
     return snippet.replace("__MP__", repr(mountpoint))
 
 
-def exec_code(name: str | None, code: str, timeout: int = 180) -> str:
+def _wait_ws_ready(runtime, ws_timeout: float = 45.0) -> None:
+    """Ensure the kernel WebSocket is actually open before sending execute_request.
+
+    `jupyter_kernel_client.wsclient.KernelWebSocketClient.start_channels()` only waits
+    `REQUEST_TIMEOUT` (10s) on `connection_ready` and silently continues when that wait
+    times out, causing `execute_interactive()` to immediately raise
+    `RuntimeError("Connection was lost.")` on a cold-starting Colab VM where the
+    WebSocket handshake takes 10-30s.
+    """
+    kc = runtime.kernel_client
+    wsclient = getattr(getattr(kc, "_manager", None), "client", None)
+    ready = getattr(wsclient, "connection_ready", None)
+    if ready is None or ready.is_set():
+        return
+    deadline = time.monotonic() + max(5.0, ws_timeout)
+    while time.monotonic() < deadline:
+        if ready.wait(timeout=min(1.0, max(0.1, deadline - time.monotonic()))):
+            return
+        thread = getattr(wsclient, "connection_thread", None)
+        if thread is not None and not thread.is_alive():
+            break
+    raise RuntimeError("Connection was lost (websocket handshake timed out).")
+
+
+def _is_transient_conn_error(exc: BaseException, elapsed: float, budget: float) -> bool:
+    """True for cold-start / WebSocket drop errors that are safe to retry."""
+    msg = str(exc)
+    if isinstance(exc, RuntimeError) and any(
+        s in msg for s in ("Connection was lost", "IOPub channel", "Kernel didn't respond")
+    ):
+        return True
+    if isinstance(exc, TimeoutError) and elapsed < budget * 0.8:
+        return True
+    # requests.exceptions.RequestException (ConnectTimeout, ReadTimeout, 502/503/504, etc.)
+    resp = getattr(exc, "response", None)
+    status = getattr(resp, "status_code", None)
+    if status in (401, 403, 404):
+        return False
+    if exc.__class__.__module__.startswith("requests"):
+        return True
+    return False
+
+
+def exec_code(name: str | None, code: str, timeout: int = 180, retries: int = 3) -> str:
     """Execute `code` in the session's kernel and return its stdout/stderr text."""
     try:
         from colab_cli.common import state
@@ -56,17 +100,29 @@ def exec_code(name: str | None, code: str, timeout: int = 180) -> str:
     except ImportError:
         return _exec_cli(name, code, timeout)
     session = state.resolve_session(name)
-    st = state.get_session(session)
-    runtime = ColabRuntime(st.url, st.token, session_name=session, history=state.history)
-    try:
-        return _outputs_to_text(runtime.execute_code(code, timeout=timeout))
-    finally:
-        # Official commands do this in a finally too; without it the kernel client's
-        # (non-daemon) threads keep the colab process alive after the command finished.
+    for attempt in range(max(1, retries)):
+        st = state.get_session(session)
+        runtime = ColabRuntime(st.url, st.token, session_name=session, history=state.history)
+        t0 = time.monotonic()
         try:
-            runtime.stop()
-        except Exception:
-            pass
+            _wait_ws_ready(runtime, ws_timeout=min(45.0, float(timeout)))
+            return _outputs_to_text(runtime.execute_code(code, timeout=timeout))
+        except Exception as exc:
+            elapsed = time.monotonic() - t0
+            if attempt >= retries - 1 or not _is_transient_conn_error(exc, elapsed, float(timeout)):
+                raise
+            delay = 2 ** (attempt + 1)
+            print(f"[dfs] kernel connection not ready ({exc}); retrying in {delay}s "
+                  f"({attempt + 1}/{retries}) ...", file=sys.stderr, flush=True)
+            time.sleep(delay)
+        finally:
+            # Official commands do this in a finally too; without it the kernel client's
+            # (non-daemon) threads keep the colab process alive after the command finished.
+            try:
+                runtime.stop()
+            except Exception:
+                pass
+    return ""
 
 
 def _exec_cli(name: str | None, code: str, timeout: int) -> str:
