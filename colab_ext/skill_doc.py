@@ -1,4 +1,4 @@
-"""Augments `colab skill` / `colab SKILL` output with multi-account and `colab dfs` guidance.
+"""Augments `colab skill` / `colab SKILL` output with multi-account, `colab drivemount`, and `colab drive` guidance.
 
 Pure Python standard library only.
 """
@@ -7,30 +7,30 @@ from __future__ import annotations
 
 import re
 
-_MARKER = "## Multi-Account & Zero-Browser Drive Extension (`colab-dfs-ext`)"
+_MARKER = "## Multi-Account & Zero-Browser Drive Extension (`colab-ext`)"
 
 EXTENSION_SKILL_SECTION = """
-## Multi-Account & Zero-Browser Drive Extension (`colab-dfs-ext`)
+## Multi-Account & Zero-Browser Drive Extension (`colab-ext`)
 
-This environment has `colab-dfs-ext` active. It adds **non-interactive Google Drive mounting (`colab dfs`)** and **isolated multi-account profiles (`colab account`, `-a/--account`, `COLAB_ACCOUNT`)** on top of `colab` without modifying upstream commands.
+This environment has `colab-ext` active. It adds **isolated multi-account profiles (`colab account`, `-a/--account`, `COLAB_ACCOUNT`)**, **non-interactive Google Drive mounting (`colab drivemount` & `colab drive`, legacy alias `colab dfs`)**, and **extension diagnostics (`colab ext`)** on top of `colab` without modifying upstream commands.
 
-### Zero-Browser Google Drive Mounting (`colab drivemount` & `colab dfs` — Agent-Runnable)
-`colab-dfs-ext` upgrades the built-in `colab drivemount` command so it runs **zero-browser via DriveFS by default** whenever Drive credentials exist (falling back to interactive consent only when unconfigured, unless `--no-fallback` or `--drive-account` / `--readonly` / `--purge-state` / `--dry-run` is passed). You can also invoke `colab dfs` directly for subcommands like `status`, `umount`, and `consent`:
+### Zero-Browser Google Drive Mounting (`colab drivemount` & `colab drive` — Agent-Runnable)
+`colab-ext` upgrades the built-in `colab drivemount` command so it runs **zero-browser via DriveFS by default** whenever Drive credentials exist (falling back to interactive consent only when unconfigured, unless `--no-fallback` or `--drive-account` / `--readonly` / `--purge-state` / `--dry-run` is passed). You can also invoke `colab drive` (or its backward-compatible alias `colab dfs`) directly for subcommands like `status`, `umount`, and `consent`:
 
-- **Pre-check credentials**: `colab dfs show` (or `colab dfs doctor` for full diagnostics).
+- **Pre-check credentials & wiring**: `colab drive show` (or `colab ext doctor` for full extension + account diagnostics).
 - **Mount / inspect / unmount**:
   - `colab drivemount -s <name> [/content/drive] [-a <acct>] [--drive-account <acct>] [--readonly] [--force] [--purge-state] [--no-fallback]`
     - Agent runs should pass `--no-fallback` so missing credentials fail immediately instead of blocking on interactive `dfs_ephemeral` consent.
-    - Pass `--upstream` (or set `COLAB_DFS_DEFAULT=0`) to force the original interactive browser flow.
-  - `colab dfs mount -s <name> [/content/drive] [--readonly] [--force --purge-state] [--drive-account <acct>]`
-  - `colab dfs status -s <name> [/content/drive]`
-  - `colab dfs umount -s <name> [/content/drive]`
-- **Agent-safe two-step Drive consent** (when `dfs show` / `doctor` reports missing credentials):
-  1. `colab [-a <acct>] dfs consent --flavor sdk --url-only` → prints an authorization URL to send to the user.
-  2. `colab [-a <acct>] dfs consent --code <PASTED_CODE>` → exchanges the code and persists `dfs_credentials.json`.
+    - Pass `--upstream` (or set `COLAB_DRIVE_DEFAULT=0` / `COLAB_DFS_DEFAULT=0`) to force the original interactive browser flow.
+  - `colab drive mount -s <name> [/content/drive] [--readonly] [--force --purge-state] [--drive-account <acct>]`
+  - `colab drive status -s <name> [/content/drive]`
+  - `colab drive umount -s <name> [/content/drive]`
+- **Agent-safe two-step Drive consent** (when `drive show` / `ext doctor` reports missing credentials):
+  1. `colab [-a <acct>] drive consent --flavor sdk --url-only` → prints an authorization URL to send to the user.
+  2. `colab [-a <acct>] drive consent --code <PASTED_CODE>` → exchanges the code and persists `dfs_credentials.json`.
 
 ### Multi-Account Management (`colab account`, `-a/--account`, `COLAB_ACCOUNT`)
-- **Select an account for any command**: pass the global option *before* the subcommand: `colab -a <account> <command> ...` (accepts profile name or email), or set `COLAB_ACCOUNT=<account>`.
+- **Select an account for any command**: pass `-a <account>` (`colab -a <account> <command> ...`, accepts profile name or email), or set `COLAB_ACCOUNT=<account>`.
 - **Offline inventory (never blocks or hits the network)**:
   - `colab account list --json` — accounts, active `*`, emails, Colab/DriveFS credential readiness, and local session names.
   - `colab account current [--json]` — active account (single-line name when `--json` is omitted).
@@ -46,14 +46,19 @@ This environment has `colab-dfs-ext` active. It adds **non-interactive Google Dr
 - **Two-step agent-safe Colab OAuth login** (and interactive setup):
   1. `colab account login <name> [--email <hint>] --url-only` → prints the Google consent URL.
   2. `colab account login <name> --code <PASTED_CODE>` → exchanges the code and stores the account token.
-  - Interactive (human at terminal): `colab account add <name> [--email <hint>] [--with-dfs | --no-dfs] [--drive-account <main>]`.
+  - Interactive (human at terminal): `colab account add <name> [--email <hint>] [--with-drive | --no-drive] [--drive-account <main>]`.
 - **Shared Drive across compute accounts** (N compute accounts × 1 storage Drive):
   - Persistent binding: `colab account set-drive <storage_acct> [-a <compute_acct> | --default | --clear]`.
-  - One-off override: `colab -a <compute_acct> dfs mount -s <name> --drive-account <storage_acct>`.
+  - One-off override: `colab -a <compute_acct> drivemount -s <name> --drive-account <storage_acct>` (or `colab -a <compute_acct> drive mount ...`).
 - **State isolation & smart session routing**:
   - Each account has isolated state at `~/.config/colab-cli/accounts/<account>/` (`sessions.json`, `history/`, `dfs_credentials.json`, `oauth_token.json`).
-  - Commands operating on an **existing** `-s <session>` (`exec`, `ssh`, `status`, `stop`, `ls`, `upload`, `download`, `dfs mount/umount/status`, `url`) auto-route to the unique owning account when `-a` / `COLAB_ACCOUNT` is omitted (printing the routing notice to `stderr`, keeping `stdout` clean).
+  - Commands operating on an **existing** `-s <session>` (`exec`, `ssh`, `status`, `stop`, `ls`, `upload`, `download`, `drivemount`, `drive mount/umount/status`, `url`) auto-route to the unique owning account when `-a` / `COLAB_ACCOUNT` is omitted (printing the routing notice to `stderr`, keeping `stdout` clean).
   - `colab new` and `colab run` never auto-route and always target the active (or `-a` / `COLAB_ACCOUNT`) account.
+
+### Extension Management (`colab ext`)
+- `colab ext doctor` — diagnose `.pth` hook, source path, accounts, Colab auth, and Drive credentials.
+- `colab ext install` — re-wire `colab_ext.pth` after a `colab-cli` upgrade.
+- `colab ext version` — print extension version and path JSON.
 """
 
 _FRONTMATTER_RE = re.compile(r"\A(---\r?\n.*?\r?\n---\r?\n)", re.DOTALL)
@@ -65,7 +70,7 @@ _DRIVEMOUNT_LINE_RE = re.compile(
 
 
 def augment_skill_markdown(base_md: str) -> str:
-    """Inject multi-account and `colab dfs` sections into upstream `SKILL.md` text."""
+    """Inject multi-account, `colab drive`, and `colab ext` sections into upstream `SKILL.md` text."""
     if not base_md or _MARKER in base_md:
         return base_md
 
@@ -79,9 +84,9 @@ def augment_skill_markdown(base_md: str) -> str:
             prefix, val, cr = m.group(1), m.group(2).rstrip(), m.group(3)
             extra = (
                 " Also supports multi-account profiles (`colab account`, `-a/--account`) "
-                "and browser-free Drive mounting (`colab dfs`)."
+                "and browser-free Drive mounting (`colab drivemount`, `colab drive`)."
             )
-            if "colab dfs" in val or "colab account" in val:
+            if "colab drive" in val or "colab dfs" in val or "colab account" in val:
                 return m.group(0)
             if (val.startswith('"') and val.endswith('"')) or (
                 val.startswith("'") and val.endswith("'")
@@ -96,13 +101,13 @@ def augment_skill_markdown(base_md: str) -> str:
 
     def _annotate_drivemount(m: re.Match[str]) -> str:
         line = m.group(1)
-        if "colab dfs mount" in line:
+        if "colab drive mount" in line or "colab dfs mount" in line:
             return line
         return (
-            "- `colab drivemount -s <name> [PATH]` — upgraded by `colab-dfs-ext` to mount "
+            "- `colab drivemount -s <name> [PATH]` — upgraded by `colab-ext` to mount "
             "**zero-browser via DriveFS automatically** when credentials exist "
             "(supports `-a <acct>`, `--drive-account <storage>`, `--readonly`, `--force`, "
-            "`--purge-state`, and `--no-fallback` for fail-fast agent runs; see `colab dfs mount` below)."
+            "`--purge-state`, and `--no-fallback` for fail-fast agent runs; see `colab drive mount` below)."
         )
 
     out = _DRIVEMOUNT_LINE_RE.sub(_annotate_drivemount, out, count=1)

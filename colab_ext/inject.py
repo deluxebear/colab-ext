@@ -1,15 +1,15 @@
-"""Injection manager for the `colab dfs` extension.
+"""Injection manager for `colab-ext`.
 
 Stdlib only, and importable from *any* interpreter (inside or outside the colab-cli
 venv). Nothing here edits a file that belongs to google-colab-cli: we drop exactly one
-file -- `colab_dfs.pth` -- into the site-packages of whichever environment provides the
-`colab` command. The .pth puts ~/.colab-dfs-ext on sys.path and imports the loader, which
-calls `colab_dfs_ext.register(app)` on the already-imported typer app.
+file -- `colab_ext.pth` -- into the site-packages of whichever environment provides the
+`colab` command. The .pth puts ~/.colab-ext on sys.path and imports the loader, which
+calls `colab_ext.register(app)` on the already-imported typer app.
 
 Why a .pth: `uv tool install -U google-colab-cli` (== `colab update --install`) rebuilds
 the tool environment, so anything *installed into* that venv can disappear. The .pth can
-disappear too, but the extension source in ~/.colab-dfs-ext never does, so restoring after
-an upgrade is one command:  python3 ~/.colab-dfs-ext/install.py
+disappear too, but the extension source in ~/.colab-ext never does, so restoring after
+an upgrade is one command:  python3 ~/.colab-ext/install.py
 """
 
 from __future__ import annotations
@@ -19,35 +19,40 @@ import os
 import subprocess
 import sys
 
-PACKAGE = "colab_dfs_ext"
-LOADER = "colab_dfs_loader.py"
-PTH_NAME = "colab_dfs.pth"
-HOME_DIR = os.path.expanduser("~/.colab-dfs-ext")
+PACKAGE = "colab_ext"
+LOADER = "colab_ext_loader.py"
+PTH_NAME = "colab_ext.pth"
+LEGACY_PTH_NAMES = ("colab_dfs.pth",)
+HOME_DIR = os.path.expanduser("~/.colab-ext")
+LEGACY_HOME_DIRS = (os.path.expanduser("~/.colab-dfs-ext"),)
 TOOL_NAME = "google-colab-cli"
 
 # site.py executes every .pth line that starts with 'import' -- but strictly as ONE line.
 # We keep the hook readable as a normal multi-line snippet and flatten it mechanically
-# (escape backslashes, quotes, newlines) at write time.
+# (escape backslashes, quotes, newlines) at write time. Keep literal '\n' out of _SNIPPET;
+# use chr(10) so single-line flattening stays valid Python.
 _SNIPPET = """
 try:
-    here = os.path.expanduser('~/.colab-dfs-ext')
+    here = os.path.expanduser(os.environ.get('COLAB_EXT_SOURCE') or os.environ.get('COLAB_DFS_EXT') or '~/.colab-ext')
     if os.path.isdir(here) and here not in sys.path:
         sys.path.insert(0, here)
-    import colab_dfs_loader
+    import colab_ext_loader
 except Exception as _exc:  # never break the colab CLI over an extension
-    if os.environ.get('COLAB_DFS_DEBUG'):
-        sys.stderr.write('[colab-dfs] loader skipped: ' + repr(_exc))
+    if os.environ.get('COLAB_EXT_DEBUG') or os.environ.get('COLAB_DFS_DEBUG'):
+        sys.stderr.write('[colab-ext] loader skipped: ' + repr(_exc) + chr(10))
 """
 
 
 def comment_line() -> str:
-    return "# colab dfs extension (%s): browser-free DriveFS mounting for %s" % (
-        _version(), TOOL_NAME)
+    return "# colab-ext (%s): multi-account & zero-browser Drive extension for %s" % (
+        _version(),
+        TOOL_NAME,
+    )
 
 
 def _version() -> str:
     try:
-        import colab_dfs_ext as _m
+        import colab_ext as _m
 
         return getattr(_m, "__version__", "?")
     except Exception:
@@ -55,21 +60,34 @@ def _version() -> str:
 
 
 def pth_contents() -> str:
-    line = (_SNIPPET.strip("\n").replace("\\", "\\\\")
-            .replace('"', '\\"').replace("\n", "\\n"))
-    return ("# %s\n"
-            "# Managed file: regenerate with `colab dfs install` or `python3 %s/install.py`\n"
-            "import os, sys; exec(compile(\"%s\", '%s', 'exec'))"
-            % (comment_line().lstrip("# "), HOME_DIR, line, PTH_NAME))
+    line = (
+        _SNIPPET.strip("\n")
+        .replace("\\", "\\\\")
+        .replace('"', '\\"')
+        .replace("\n", "\\n")
+    )
+    return (
+        "# %s\n"
+        "# Managed file: regenerate with `colab ext install` or `python3 %s/install.py`\n"
+        'import os, sys; exec(compile("%s", \'%s\', \'exec\'))'
+        % (comment_line().lstrip("# "), HOME_DIR, line, PTH_NAME)
+    )
 
 
 # --- where to inject -----------------------------------------------------------------------
 def _site_packages_of(interpreter: str) -> str | None:
     """site-packages of a given python interpreter (or None)."""
     try:
-        out = subprocess.run(
-            [interpreter, "-c", "import site,sys;print(site.getsitepackages()[0])"],
-            capture_output=True, text=True, timeout=20).stdout.strip().splitlines()
+        out = (
+            subprocess.run(
+                [interpreter, "-c", "import site,sys;print(site.getsitepackages()[0])"],
+                capture_output=True,
+                text=True,
+                timeout=20,
+            )
+            .stdout.strip()
+            .splitlines()
+        )
         return out[-1] if out else None
     except Exception:
         return None
@@ -142,7 +160,8 @@ def _package_dir() -> str | None:
     # otherwise the (stale) installed copy in HOME_DIR would shadow every fix and
     # `install.py` would silently stop propagating updates (source == HOME_DIR -> no copy).
     here = os.path.dirname(os.path.abspath(__file__))
-    for base in (os.environ.get("COLAB_DFS_EXT"), here, HOME_DIR):
+    env_src = os.environ.get("COLAB_EXT_SOURCE") or os.environ.get("COLAB_DFS_EXT")
+    for base in (env_src, here, HOME_DIR):
         if base:
             d = os.path.abspath(os.path.expanduser(base))
             if os.path.isdir(os.path.join(d, PACKAGE)):
@@ -153,11 +172,11 @@ def _package_dir() -> str | None:
 
 
 def source_dir() -> str | None:
-    """A directory that contains colab_dfs_ext/ + colab_dfs_loader.py."""
+    """A directory that contains colab_ext/ + colab_ext_loader.py."""
     pkg = _package_dir()
     if pkg and os.path.isfile(os.path.join(pkg, LOADER)):
         return pkg
-    # running from a git checkout: .../extension/colab_dfs_ext/inject.py
+    # running from a git checkout: .../colab_ext/inject.py
     here = os.path.dirname(os.path.abspath(__file__))
     for base in (os.path.dirname(here), here):
         if os.path.isdir(os.path.join(base, PACKAGE)) and os.path.isfile(os.path.join(base, LOADER)):
@@ -179,41 +198,72 @@ def ensure(site_dir: str | None = None, copy_source: bool = True, quiet: bool = 
     """Make sure the extension is wired into the colab-cli environment. Idempotent."""
     import shutil
 
-    report = {"site_dir": site_dir or target_site_dir(), "source": source_dir(),
-              "installed": [], "changed": False}
+    resolved_site = site_dir or target_site_dir()
+    report = {
+        "site_dir": resolved_site,
+        "source": source_dir(),
+        "installed": [],
+        "removed_legacy": [],
+        "changed": False,
+    }
     if not report["site_dir"]:
         report["error"] = "could not find the site-packages of the colab-cli environment"
         return report
-    if (copy_source and report["source"]
-            and os.path.realpath(report["source"]) != os.path.realpath(HOME_DIR)):
+    if (
+        copy_source
+        and report["source"]
+        and os.path.realpath(report["source"]) != os.path.realpath(HOME_DIR)
+    ):
         dst = os.path.join(HOME_DIR, PACKAGE)
         os.makedirs(HOME_DIR, exist_ok=True)
         shutil.rmtree(dst, ignore_errors=True)
-        shutil.copytree(os.path.join(report["source"], PACKAGE), dst,
-                        ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
+        shutil.copytree(
+            os.path.join(report["source"], PACKAGE),
+            dst,
+            ignore=shutil.ignore_patterns("__pycache__", "*.pyc"),
+        )
         shutil.copy(os.path.join(report["source"], LOADER), os.path.join(HOME_DIR, LOADER))
         report["installed"].append(HOME_DIR)
         report["source"] = HOME_DIR
     path = pth_path(report["site_dir"])
     body = pth_contents()
-    old = open(path).read() if path and os.path.exists(path) else None
+    old = open(path, encoding="utf-8").read() if path and os.path.exists(path) else None
     if path and old != body:
-        open(path, "w").write(body)
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write(body)
         report["changed"] = True
         report["installed"].append(path)
     report["pth"] = path
+
+    for legacy_name in LEGACY_PTH_NAMES:
+        legacy_pth = os.path.join(report["site_dir"], legacy_name)
+        if os.path.islink(legacy_pth) or os.path.exists(legacy_pth):
+            os.unlink(legacy_pth)
+            report["changed"] = True
+            report["removed_legacy"].append(legacy_pth)
+            if not quiet:
+                print("[colab-ext] removed legacy hook %s" % legacy_pth)
+
     if not quiet:
         for p in report["installed"]:
-            print("[colab-dfs] wrote %s" % p)
+            print("[colab-ext] wrote %s" % p)
     return report
 
 
 def remove(site_dir: str | None = None) -> dict:
-    path = pth_path(site_dir)
-    out = {"pth": path, "removed": False}
-    if path and os.path.exists(path):
+    resolved_site = site_dir or target_site_dir()
+    path = pth_path(resolved_site)
+    out: dict = {"pth": path, "removed": False, "removed_legacy": []}
+    if path and (os.path.islink(path) or os.path.exists(path)):
         os.unlink(path)
         out["removed"] = True
+    if resolved_site:
+        for legacy_name in LEGACY_PTH_NAMES:
+            legacy_pth = os.path.join(resolved_site, legacy_name)
+            if os.path.islink(legacy_pth) or os.path.exists(legacy_pth):
+                os.unlink(legacy_pth)
+                out["removed"] = True
+                out["removed_legacy"].append(legacy_pth)
     return out
 
 
@@ -238,6 +288,9 @@ def reload_ok() -> bool:
     try:
         import colab_cli.cli as cli
 
-        return bool(getattr(cli, "_colab_dfs_registered", False))
+        return bool(
+            getattr(cli.app, "_colab_ext_registered", False)
+            or getattr(cli, "_colab_ext_registered", False)
+        )
     except Exception:
         return False

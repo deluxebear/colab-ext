@@ -131,7 +131,7 @@ _EXISTING_SESSION_TOP_COMMANDS = frozenset({
     "install",
     "ssh",
 })
-_EXISTING_SESSION_DFS_COMMANDS = frozenset({"mount", "umount", "status"})
+_EXISTING_SESSION_DRIVE_COMMANDS = frozenset({"mount", "umount", "status"})
 _GLOBAL_VALUE_FLAGS = frozenset({
     "-c",
     "--client-oauth-config",
@@ -241,15 +241,28 @@ def _patch_auth(force: bool = False) -> None:
     from google_auth_oauthlib.flow import InstalledAppFlow
     from colab_cli import auth
 
-    if getattr(auth, "_colab_dfs_auth_patched", False) and not force:
+    if (
+        getattr(auth, "_colab_ext_auth_patched", False)
+        or getattr(auth, "_colab_dfs_auth_patched", False)
+    ) and not force:
         return
 
-    if not hasattr(auth, "_colab_dfs_orig_get_token"):
-        auth._colab_dfs_orig_get_token = auth._get_token_from_keyring
-        auth._colab_dfs_orig_save_token = auth._save_token_to_keyring
-        auth._colab_dfs_orig_remove_legacy = auth._remove_legacy_token
-        auth._colab_dfs_orig_run_remote_flow = auth._run_remote_flow
-        auth._colab_dfs_orig_get_adc = auth._get_adc_credentials
+    if not hasattr(auth, "_colab_ext_orig_get_token"):
+        auth._colab_ext_orig_get_token = getattr(
+            auth, "_colab_dfs_orig_get_token", auth._get_token_from_keyring
+        )
+        auth._colab_ext_orig_save_token = getattr(
+            auth, "_colab_dfs_orig_save_token", auth._save_token_to_keyring
+        )
+        auth._colab_ext_orig_remove_legacy = getattr(
+            auth, "_colab_dfs_orig_remove_legacy", auth._remove_legacy_token
+        )
+        auth._colab_ext_orig_run_remote_flow = getattr(
+            auth, "_colab_dfs_orig_run_remote_flow", auth._run_remote_flow
+        )
+        auth._colab_ext_orig_get_adc = getattr(
+            auth, "_colab_dfs_orig_get_adc", auth._get_adc_credentials
+        )
 
     # Prevent legacy ~/.config/colab-cli/token.json from leaking into non-default accounts.
     auth.LEGACY_TOKEN_PATH = _DISABLED_LEGACY_TOKEN
@@ -303,7 +316,7 @@ def _patch_auth(force: bool = False) -> None:
 
         def _invoke():
             try:
-                return auth._colab_dfs_orig_get_adc()
+                return auth._colab_ext_orig_get_adc()
             except SystemExit as exc:
                 if accounts.NON_INTERACTIVE_AUTH.get():
                     raise RuntimeError(
@@ -329,6 +342,7 @@ def _patch_auth(force: bool = False) -> None:
     auth._save_token_to_keyring = _save_token_hook
     auth._run_remote_flow = _run_remote_flow_hook
     auth._get_adc_credentials = _get_adc_hook
+    auth._colab_ext_auth_patched = True
     auth._colab_dfs_auth_patched = True
 
 
@@ -336,15 +350,25 @@ def _patch_state_history(force: bool = False) -> None:
     from colab_cli import common
     from colab_cli.history import HistoryLogger
 
-    if getattr(common.State, "_colab_dfs_history_patched", False) and not force:
+    if (
+        getattr(common.State, "_colab_ext_history_patched", False)
+        or getattr(common.State, "_colab_dfs_history_patched", False)
+    ) and not force:
         return
 
-    orig_prop = getattr(common.State, "_colab_dfs_orig_history", common.State.history)
-    common.State._colab_dfs_orig_history = orig_prop
+    orig_prop = getattr(
+        common.State,
+        "_colab_ext_orig_history",
+        getattr(common.State, "_colab_dfs_orig_history", common.State.history),
+    )
+    common.State._colab_ext_orig_history = orig_prop
 
     def _history_getter(self):
         if self._history is None:
-            if self is common.state and not getattr(self, "_colab_dfs_explicit_config", False):
+            explicit = getattr(self, "_colab_ext_explicit_config", False) or getattr(
+                self, "_colab_dfs_explicit_config", False
+            )
+            if self is common.state and not explicit:
                 self._history = HistoryLogger(
                     log_dir=accounts.history_dir(accounts.current_account())
                 )
@@ -353,6 +377,7 @@ def _patch_state_history(force: bool = False) -> None:
         return self._history
 
     common.State.history = property(_history_getter)
+    common.State._colab_ext_history_patched = True
     common.State._colab_dfs_history_patched = True
 
 
@@ -404,9 +429,9 @@ def _extract_subcommand_session(
     eligible = False
     if subcommand in _EXISTING_SESSION_TOP_COMMANDS:
         eligible = True
-    elif subcommand == "dfs":
-        dfs_sub = _first_positional(sub_toks, value_flags={"-a", "--account"})
-        eligible = dfs_sub in _EXISTING_SESSION_DFS_COMMANDS
+    elif subcommand in ("drive", "dfs"):
+        drive_sub = _first_positional(sub_toks, value_flags={"-a", "--account"})
+        eligible = drive_sub in _EXISTING_SESSION_DRIVE_COMMANDS
 
     session_name = _extract_option_value(sub_toks, "-s", "--session")
     return session_name, eligible, sub_toks
@@ -446,17 +471,28 @@ def _wrap_group_parse_args(app: typer.Typer, force: bool = False) -> None:
     import colab_cli.cli as cli
 
     cls = getattr(cli, "AlphabeticalGroup", None) or app.info.cls
-    if cls is None or (getattr(cls, "_colab_dfs_parse_wrapped", False) and not force):
+    if cls is None or (
+        (
+            getattr(cls, "_colab_ext_parse_wrapped", False)
+            or getattr(cls, "_colab_dfs_parse_wrapped", False)
+        )
+        and not force
+    ):
         return
-    orig_parse = getattr(cls, "_colab_dfs_orig_parse_args", cls.parse_args)
-    cls._colab_dfs_orig_parse_args = orig_parse
+    orig_parse = getattr(
+        cls,
+        "_colab_ext_orig_parse_args",
+        getattr(cls, "_colab_dfs_orig_parse_args", cls.parse_args),
+    )
+    cls._colab_ext_orig_parse_args = orig_parse
 
     @functools.wraps(orig_parse)
     def wrapped_parse(self, ctx, args):
-        ctx.meta["_colab_dfs_raw_args"] = list(args)
+        ctx.meta["_colab_ext_raw_args"] = list(args)
         return orig_parse(self, ctx, args)
 
     cls.parse_args = wrapped_parse
+    cls._colab_ext_parse_wrapped = True
     cls._colab_dfs_parse_wrapped = True
 
 
@@ -480,8 +516,10 @@ def _apply_account_to_global_state(
     if explicit_config is None:
         state.config_path = sessions_file
         state._store = None
+        state._colab_ext_explicit_config = False
         state._colab_dfs_explicit_config = False
     else:
+        state._colab_ext_explicit_config = not is_own_sessions
         state._colab_dfs_explicit_config = not is_own_sessions
 
     state._history = None
@@ -501,10 +539,20 @@ def _apply_account_to_global_state(
 
 def _wrap_global_callback(app: typer.Typer, force: bool = False) -> None:
     reg_cb = getattr(app, "registered_callback", None)
-    if reg_cb is None or (getattr(reg_cb.callback, "_colab_dfs_wrapped", False) and not force):
+    if reg_cb is None or (
+        (
+            getattr(reg_cb.callback, "_colab_ext_wrapped", False)
+            or getattr(reg_cb.callback, "_colab_dfs_wrapped", False)
+        )
+        and not force
+    ):
         return
 
-    orig_cb = getattr(reg_cb.callback, "_colab_dfs_orig", reg_cb.callback)
+    orig_cb = getattr(
+        reg_cb.callback,
+        "_colab_ext_orig",
+        getattr(reg_cb.callback, "_colab_dfs_orig", reg_cb.callback),
+    )
     sig = inspect.signature(orig_cb, eval_str=True)
     account_param = inspect.Parameter(
         "account",
@@ -519,7 +567,7 @@ def _wrap_global_callback(app: typer.Typer, force: bool = False) -> None:
 
         ctx: Optional[typer.Context] = kwargs.get("ctx") or (args[0] if args else None)
         raw_args = (
-            ctx.meta.get("_colab_dfs_raw_args")
+            ctx.meta.get("_colab_ext_raw_args") or ctx.meta.get("_colab_dfs_raw_args")
             if ctx is not None and isinstance(getattr(ctx, "meta", None), dict)
             else None
         )
@@ -532,16 +580,16 @@ def _wrap_global_callback(app: typer.Typer, force: bool = False) -> None:
         session_name, allow_routing, sub_toks = _extract_subcommand_session(
             list(raw_args), subcommand
         )
-        if not account and subcommand in ("dfs", "drivemount"):
+        if not account and subcommand in ("drive", "dfs", "drivemount", "ext"):
             account = _extract_option_value(sub_toks, "-a", "--account")
 
         allow_create = False
         if subcommand in ("account", "acct"):
             acct_sub = _first_positional(sub_toks, value_flags={"-a", "--account"})
             allow_create = acct_sub in ("add", "login")
-        elif subcommand == "dfs":
-            dfs_sub = _first_positional(sub_toks, value_flags={"-a", "--account"})
-            allow_create = dfs_sub == "consent"
+        elif subcommand in ("drive", "dfs"):
+            drive_sub = _first_positional(sub_toks, value_flags={"-a", "--account"})
+            allow_create = drive_sub == "consent"
 
         try:
             acct, source = accounts.resolve_account(
@@ -572,7 +620,7 @@ def _wrap_global_callback(app: typer.Typer, force: bool = False) -> None:
         reg = accounts.load_registry()
         pre_sep = _pre_sep_tokens(list(raw_args))
         suppress_update = (
-            subcommand in ("account", "acct", "dfs")
+            subcommand in ("account", "acct", "drive", "dfs", "ext")
             or "--json" in pre_sep
         )
 
@@ -607,7 +655,8 @@ def _wrap_global_callback(app: typer.Typer, force: bool = False) -> None:
     ann["account"] = _AccountOpt
     wrapped_cb.__annotations__ = ann
     wrapped_cb.__doc__ = orig_cb.__doc__
-    wrapped_cb._colab_dfs_orig = orig_cb
+    wrapped_cb._colab_ext_orig = orig_cb
+    wrapped_cb._colab_ext_wrapped = True
     wrapped_cb._colab_dfs_wrapped = True
     reg_cb.callback = wrapped_cb
 
@@ -744,15 +793,26 @@ def probe_all_accounts(
 # --------------------------------------------------------------------------------------
 
 
+def _is_wrapped(cb: Any) -> bool:
+    return bool(
+        getattr(cb, "_colab_ext_wrapped", False)
+        or getattr(cb, "_colab_dfs_wrapped", False)
+    )
+
+
+def _unwrap_cb(cb: Any) -> Any:
+    return getattr(cb, "_colab_ext_orig", getattr(cb, "_colab_dfs_orig", cb))
+
+
 def _wrap_skill(app: typer.Typer, force: bool = False) -> None:
     for reg in list(getattr(app, "registered_commands", []) or []):
         name = getattr(reg, "name", None)
         if name not in ("skill", "SKILL"):
             continue
         cb = getattr(reg, "callback", None)
-        if cb is None or (getattr(cb, "_colab_dfs_wrapped", False) and not force):
+        if cb is None or (_is_wrapped(cb) and not force):
             continue
-        original = getattr(cb, "_colab_dfs_orig", cb)
+        original = _unwrap_cb(cb)
 
         def _make_wrapper(orig):
             @functools.wraps(orig)
@@ -778,7 +838,8 @@ def _wrap_skill(app: typer.Typer, force: bool = False) -> None:
                         return None
                     return orig(*args, **kwargs)
 
-            wrapper._colab_dfs_orig = orig
+            wrapper._colab_ext_orig = orig
+            wrapper._colab_ext_wrapped = True
             wrapper._colab_dfs_wrapped = True
             return wrapper
 
@@ -790,9 +851,9 @@ def _wrap_sessions(app: typer.Typer, force: bool = False) -> None:
         if getattr(reg, "name", None) != "sessions":
             continue
         cb = getattr(reg, "callback", None)
-        if cb is None or (getattr(cb, "_colab_dfs_wrapped", False) and not force):
+        if cb is None or (_is_wrapped(cb) and not force):
             continue
-        original = getattr(cb, "_colab_dfs_orig", cb)
+        original = _unwrap_cb(cb)
 
         def wrapped_sessions(all_accounts: _SessionsAllOpt = False, json_out: _JsonOpt = False):
             if not all_accounts and not json_out:
@@ -834,7 +895,8 @@ def _wrap_sessions(app: typer.Typer, force: bool = False) -> None:
 
         wrapped_sessions.__name__ = getattr(original, "__name__", "sessions")
         wrapped_sessions.__doc__ = getattr(original, "__doc__", None) or "List all active sessions"
-        wrapped_sessions._colab_dfs_orig = original
+        wrapped_sessions._colab_ext_orig = original
+        wrapped_sessions._colab_ext_wrapped = True
         wrapped_sessions._colab_dfs_wrapped = True
         reg.callback = wrapped_sessions
         return
@@ -844,9 +906,9 @@ def _wrap_usage(app: typer.Typer, force: bool = False) -> None:
     for reg in list(getattr(app, "registered_commands", []) or []):
         raw_cb = getattr(reg, "callback", None)
         name = getattr(reg, "name", None) or getattr(raw_cb, "__name__", "")
-        if name != "usage" or raw_cb is None or (getattr(raw_cb, "_colab_dfs_wrapped", False) and not force):
+        if name != "usage" or raw_cb is None or (_is_wrapped(raw_cb) and not force):
             continue
-        cb = getattr(raw_cb, "_colab_dfs_orig", raw_cb)
+        cb = _unwrap_cb(raw_cb)
 
         def wrapped_usage(all_accounts: _UsageAllOpt = False, json_out: _JsonOpt = False):
             if not all_accounts and not json_out:
@@ -887,7 +949,8 @@ def _wrap_usage(app: typer.Typer, force: bool = False) -> None:
 
         wrapped_usage.__name__ = getattr(cb, "__name__", name)
         wrapped_usage.__doc__ = getattr(cb, "__doc__", None) or "Show account compute-unit usage"
-        wrapped_usage._colab_dfs_orig = cb
+        wrapped_usage._colab_ext_orig = cb
+        wrapped_usage._colab_ext_wrapped = True
         wrapped_usage._colab_dfs_wrapped = True
         reg.name = reg.name or name
         reg.callback = wrapped_usage
@@ -899,9 +962,9 @@ def _wrap_whoami(app: typer.Typer, force: bool = False) -> None:
         if getattr(reg, "name", None) != "whoami":
             continue
         cb = getattr(reg, "callback", None)
-        if cb is None or (getattr(cb, "_colab_dfs_wrapped", False) and not force):
+        if cb is None or (_is_wrapped(cb) and not force):
             continue
-        original = getattr(cb, "_colab_dfs_orig", cb)
+        original = _unwrap_cb(cb)
 
         @functools.wraps(original)
         def wrapper(*args, **kwargs):
@@ -930,7 +993,8 @@ def _wrap_whoami(app: typer.Typer, force: bool = False) -> None:
                                 with contextlib.suppress(Exception):
                                     accounts.update_account_meta(acct, email=found_email)
 
-        wrapper._colab_dfs_orig = original
+        wrapper._colab_ext_orig = original
+        wrapper._colab_ext_wrapped = True
         wrapper._colab_dfs_wrapped = True
         reg.callback = wrapper
         return
@@ -956,9 +1020,9 @@ def _wrap_url(app: typer.Typer, force: bool = False) -> None:
         if getattr(reg, "name", None) != "url":
             continue
         cb = getattr(reg, "callback", None)
-        if cb is None or (getattr(cb, "_colab_dfs_wrapped", False) and not force):
+        if cb is None or (_is_wrapped(cb) and not force):
             continue
-        original = getattr(cb, "_colab_dfs_orig", cb)
+        original = _unwrap_cb(cb)
 
         @functools.wraps(original)
         def wrapper(
@@ -984,7 +1048,8 @@ def _wrap_url(app: typer.Typer, force: bool = False) -> None:
 
         wrapper.__signature__ = inspect.signature(original, eval_str=True)
         wrapper.__annotations__ = dict(inspect.get_annotations(original, eval_str=True))
-        wrapper._colab_dfs_orig = original
+        wrapper._colab_ext_orig = original
+        wrapper._colab_ext_wrapped = True
         wrapper._colab_dfs_wrapped = True
         reg.callback = wrapper
         return
@@ -1023,9 +1088,9 @@ def _wrap_drivemount(app: typer.Typer, force: bool = False) -> None:
     for reg in list(getattr(app, "registered_commands", []) or []):
         raw_cb = getattr(reg, "callback", None)
         name = getattr(reg, "name", None) or getattr(raw_cb, "__name__", "")
-        if name != "drivemount" or raw_cb is None or (getattr(raw_cb, "_colab_dfs_wrapped", False) and not force):
+        if name != "drivemount" or raw_cb is None or (_is_wrapped(raw_cb) and not force):
             continue
-        orig_cb = getattr(raw_cb, "_colab_dfs_orig", raw_cb)
+        orig_cb = _unwrap_cb(raw_cb)
 
         def wrapped_drivemount(
             session: _DrivemountSessionOpt = None,
@@ -1049,7 +1114,7 @@ def _wrap_drivemount(app: typer.Typer, force: bool = False) -> None:
                 raise typer.BadParameter("mountpoint must not contain a space")
 
             try:
-                colab_acct = commands._activate_dfs_account(
+                colab_acct = commands._activate_account(
                     account,
                     session=session,
                     allow_routing=True,
@@ -1063,10 +1128,10 @@ def _wrap_drivemount(app: typer.Typer, force: bool = False) -> None:
                 typer.echo(f"[colab] {exc}", err=True)
                 raise typer.Exit(code=1)
 
-            dfs_disabled = upstream or (
-                os.environ.get("COLAB_DFS_DEFAULT", "").strip().lower()
-                in ("0", "false", "no", "off")
-            )
+            drv_default_env = (os.environ.get("COLAB_DRIVE_DEFAULT") or "").strip()
+            if not drv_default_env:
+                drv_default_env = (os.environ.get("COLAB_DFS_DEFAULT") or "").strip()
+            dfs_disabled = upstream or (drv_default_env.lower() in ("0", "false", "no", "off"))
             dfs_only_requested = (
                 bool(drive_account)
                 or (drive_acct != colab_acct)
@@ -1081,7 +1146,7 @@ def _wrap_drivemount(app: typer.Typer, force: bool = False) -> None:
             if dfs_disabled:
                 if dfs_only_requested:
                     typer.echo(
-                        "[colab] --upstream / COLAB_DFS_DEFAULT=0 cannot be combined with "
+                        "[colab-ext] --upstream / COLAB_DRIVE_DEFAULT=0 cannot be combined with "
                         "DriveFS-only options (--drive-account, --readonly, --purge-state, "
                         "--from-env, --cli-token, --mode, --dry-run).",
                         err=True,
@@ -1114,7 +1179,7 @@ def _wrap_drivemount(app: typer.Typer, force: bool = False) -> None:
                     drive_mount.main(argv)
                 except SystemExit as exc:
                     if isinstance(exc.code, str):
-                        typer.echo(f"[colab-dfs] {exc.code}", err=True)
+                        typer.echo(f"[colab-ext] {exc.code}", err=True)
                         raise typer.Exit(code=1)
                     raise typer.Exit(code=int(exc.code or 0))
                 raise typer.Exit(code=0)
@@ -1135,18 +1200,18 @@ def _wrap_drivemount(app: typer.Typer, force: bool = False) -> None:
                 )
             except (SystemExit, Exception) as exc:
                 consent_cmd = (
-                    "colab dfs consent"
+                    "colab drive consent"
                     if drive_acct == accounts.DEFAULT_ACCOUNT
-                    else f"colab -a {drive_acct} dfs consent"
+                    else f"colab -a {drive_acct} drive consent"
                 )
                 if no_fallback or accounts.NON_INTERACTIVE_AUTH.get() or dfs_only_requested:
                     typer.echo(
-                        f"[colab-dfs] Cannot mount via DriveFS ({exc}). Run '{consent_cmd}' first.",
+                        f"[colab-ext] Cannot mount via DriveFS ({exc}). Run '{consent_cmd}' first.",
                         err=True,
                     )
                     raise typer.Exit(code=1)
                 typer.echo(
-                    f"[colab-dfs] No stored DriveFS credentials for '{drive_acct}' "
+                    f"[colab-ext] No stored DriveFS credentials for '{drive_acct}' "
                     f"(tip: run '{consent_cmd}' once for zero-browser mounts); "
                     "falling back to interactive browser drivemount...",
                     err=True,
@@ -1162,7 +1227,8 @@ def _wrap_drivemount(app: typer.Typer, force: bool = False) -> None:
             "Mount Google Drive at path (zero-browser via DriveFS when credentials exist; "
             "falls back to interactive browser flow)."
         )
-        wrapped_drivemount._colab_dfs_orig = orig_cb
+        wrapped_drivemount._colab_ext_orig = orig_cb
+        wrapped_drivemount._colab_ext_wrapped = True
         wrapped_drivemount._colab_dfs_wrapped = True
         reg.name = reg.name or "drivemount"
         reg.callback = wrapped_drivemount
@@ -1171,7 +1237,10 @@ def _wrap_drivemount(app: typer.Typer, force: bool = False) -> None:
 
 def install_hooks(app: typer.Typer, force: bool = False) -> None:
     """Install all multi-account and skill hooks onto `colab_cli`."""
-    if getattr(app, "_colab_dfs_hooks_installed", False) and not force:
+    if (
+        getattr(app, "_colab_ext_hooks_installed", False)
+        or getattr(app, "_colab_dfs_hooks_installed", False)
+    ) and not force:
         return
     _patch_auth(force=force)
     _patch_state_history(force=force)
@@ -1183,4 +1252,5 @@ def install_hooks(app: typer.Typer, force: bool = False) -> None:
     _wrap_whoami(app, force=force)
     _wrap_url(app, force=force)
     _wrap_drivemount(app, force=force)
+    setattr(app, "_colab_ext_hooks_installed", True)
     setattr(app, "_colab_dfs_hooks_installed", True)

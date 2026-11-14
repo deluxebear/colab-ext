@@ -32,7 +32,7 @@ except ImportError:  # standalone execution outside the package
     _ext_parent = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     if _ext_parent not in sys.path:
         sys.path.insert(0, _ext_parent)
-    from colab_dfs_ext import accounts  # type: ignore[no-redef]
+    from colab_ext import accounts  # type: ignore[no-redef]
 
 STORE = os.path.expanduser("~/.config/colab-cli/dfs_credentials.json")
 CLI_TOKEN = os.path.expanduser("~/.config/colab-cli/token.json")
@@ -111,7 +111,7 @@ sh('umount -f "%s" 2>/dev/null; umount "%s" 2>/dev/null' % (MP, MP))
 if in_mounts():
     # never rm -rf through a live FUSE mount: that would delete real Drive files
     result(False, stage="teardown", error="mountpoint still mounted: " + MP,
-           hint="unmount: colab dfs umount -s <session>  (or: colab exec -s <session> -c 'umount -f %s')" % MP)
+           hint="unmount: colab drive umount -s <session>  (or: colab exec -s <session> -c 'umount -f %s')" % MP)
 if os.path.isdir(MP):
     sh('rm -rf "%s"' % MP)
 os.makedirs(MP, exist_ok=True)
@@ -493,7 +493,7 @@ def _in_cli() -> bool:
 def _consent_hint(account: str | None = None) -> str:
     if _in_cli():
         prefix = f"colab -a {account} " if account and account != accounts.DEFAULT_ACCOUNT else "colab "
-        return f"{prefix}dfs consent"
+        return f"{prefix}drive consent"
     acct_flag = f" --account {account}" if account else ""
     return f"python3 dfs_creds.py consent{acct_flag} --flavor sdk"
 
@@ -501,7 +501,7 @@ def _consent_hint(account: str | None = None) -> str:
 def make_cfg(session=None, path="/content/drive", mode="shim", force=False, readonly=False,
              timeout=120, port=8012, cli_token=False, from_env=False, drive_extra=(),
              purge_state=False, user_id=None, email=None, account=None, drive_account=None) -> dict:
-    """Build the remote config without going through argparse (used by `colab dfs mount`)."""
+    """Build the remote config without going through argparse (used by `colab drive mount`)."""
     ns = argparse.Namespace(session=session, path=path, mode=mode, force=force,
                             readonly=readonly, timeout=timeout, port=port, cli_token=cli_token,
                             from_env=from_env, drive_extra=list(drive_extra),

@@ -18,6 +18,20 @@ account_app = typer.Typer(
     context_settings={"help_option_names": ["-h", "--help"]},
 )
 
+# Module-level Annotated aliases required for Python 3.14 inspect.signature(..., eval_str=True).
+_AddWithDriveOpt = Annotated[
+    bool,
+    typer.Option("--with-drive/--no-drive", help="Also run DriveFS consent after Colab login"),
+]
+_LoginWithDriveOpt = Annotated[
+    bool,
+    typer.Option("--with-drive/--no-drive", help="Also run DriveFS consent after login"),
+]
+_CompatWithDfsOpt = Annotated[
+    Optional[bool],
+    typer.Option("--with-dfs/--no-dfs", hidden=True),
+]
+
 
 def _drive_summary(acct: str, reg: dict[str, Any]) -> dict[str, Any]:
     drv_acct, drv_src = accounts.resolve_drive_account(acct, for_consent=False)
@@ -286,10 +300,8 @@ def use_account(
 def add_account(
     name: Annotated[str, typer.Argument(help="New account profile name")],
     email: Annotated[Optional[str], typer.Option("--email", help="Account email hint (login_hint)")] = None,
-    with_dfs: Annotated[
-        bool,
-        typer.Option("--with-dfs/--no-dfs", help="Also run DriveFS consent after Colab login"),
-    ] = True,
+    with_drive: _AddWithDriveOpt = True,
+    with_dfs: _CompatWithDfsOpt = None,
     drive_account: Annotated[
         Optional[str],
         typer.Option("--drive-account", help="Bind Drive mounts to an existing storage account"),
@@ -311,6 +323,7 @@ def add_account(
     ] = False,
 ):
     """Register and authenticate a new Colab account profile."""
+    effective_with_drive = with_drive if with_dfs is None else with_dfs
     try:
         accounts.validate_account_name(name)
         resolved_drive: Optional[str] = None
@@ -375,7 +388,7 @@ def add_account(
             + (f" ({logged_email})" if logged_email else "")
             + f" [storage: {storage}]"
         )
-        if with_dfs and not resolved_drive:
+        if effective_with_drive and not resolved_drive:
             typer.echo(f"[account] Starting DriveFS consent for '{name}'...", err=True)
             rc = _run_dfs_consent_for_account(
                 name,
@@ -386,7 +399,7 @@ def add_account(
             if rc != 0:
                 typer.echo(
                     f"[account] Warning: DriveFS consent exited with {rc}. "
-                    f"Re-run later with `colab -a {name} dfs consent`.",
+                    f"Re-run later with `colab -a {name} drive consent`.",
                     err=True,
                 )
 
@@ -402,10 +415,8 @@ def login_account(
         typer.Argument(help="Account name (defaults to currently active account)"),
     ] = None,
     email: Annotated[Optional[str], typer.Option("--email", help="Account email hint (login_hint)")] = None,
-    with_dfs: Annotated[
-        bool,
-        typer.Option("--with-dfs/--no-dfs", help="Also run DriveFS consent after login"),
-    ] = False,
+    with_drive: _LoginWithDriveOpt = False,
+    with_dfs: _CompatWithDfsOpt = None,
     flavor: Annotated[str, typer.Option("--flavor", help="DriveFS consent flavor: dfs | sdk | custom")] = "dfs",
     url_only: Annotated[
         bool,
@@ -418,6 +429,7 @@ def login_account(
     no_browser: Annotated[bool, typer.Option("--no-browser", help="Do not auto-open browser")] = False,
 ):
     """Log in or re-authenticate a Colab account (supports headless --url-only / --code)."""
+    effective_with_drive = with_drive if with_dfs is None else with_dfs
     try:
         if name:
             acct = accounts.lookup_account(name, allow_create=not bool(code))
@@ -449,7 +461,7 @@ def login_account(
         + (f" ({logged_email})" if logged_email else "")
         + f" [storage: {storage}]"
     )
-    if with_dfs:
+    if effective_with_drive:
         rc = _run_dfs_consent_for_account(
             acct,
             flavor=flavor,

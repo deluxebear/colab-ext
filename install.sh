@@ -1,29 +1,29 @@
 #!/bin/sh
-# Bootstrap installer for colab-dfs-ext (https://github.com/deluxebear/colab-dfs-ext).
+# Bootstrap installer for colab-ext (formerly colab-dfs-ext).
 #
 # One-line install (any POSIX shell, no git required):
 #
-#     curl -fsSL https://raw.githubusercontent.com/deluxebear/colab-dfs-ext/main/install.sh | sh
+#     curl -fsSL https://raw.githubusercontent.com/deluxebear/colab-ext/main/install.sh | sh
 #
 # or with wget:
 #
-#     wget -qO- https://raw.githubusercontent.com/deluxebear/colab-dfs-ext/main/install.sh | sh
+#     wget -qO- https://raw.githubusercontent.com/deluxebear/colab-ext/main/install.sh | sh
 #
 # Env overrides:
-#     COLAB_DFS_REPO=owner/repo     source repository     (default: deluxebear/colab-dfs-ext)
-#     COLAB_DFS_REF=main            branch or tag         (default: main)
+#     COLAB_EXT_REPO=owner/repo     source repository     (default: deluxebear/colab-ext, fallback deluxebear/colab-dfs-ext)
+#     COLAB_EXT_REF=main            branch or tag         (default: main)
+#     (Legacy COLAB_DFS_REPO / COLAB_DFS_REF are also honored.)
 #
 # What it does: fetch the repo tarball, run `python3 install.py` from it. That copies the
-# extension to ~/.colab-dfs-ext and drops a single .pth file into the colab-cli
+# extension to ~/.colab-ext and drops a single .pth file (colab_ext.pth) into the colab-cli
 # environment's site-packages. Nothing else on your machine is touched.
 set -eu
 
-REPO="${COLAB_DFS_REPO:-deluxebear/colab-dfs-ext}"
-REF="${COLAB_DFS_REF:-main}"
-TARBALL_URL="https://github.com/${REPO}/archive/refs/heads/${REF}.tar.gz"
+EXPLICIT_REPO="${COLAB_EXT_REPO:-${COLAB_DFS_REPO:-}}"
+REF="${COLAB_EXT_REF:-${COLAB_DFS_REF:-main}}"
 
-say() { printf '[colab-dfs] %s\n' "$*"; }
-die() { printf '[colab-dfs] ERROR: %s\n' "$*" >&2; exit 1; }
+say() { printf '[colab-ext] %s\n' "$*"; }
+die() { printf '[colab-ext] ERROR: %s\n' "$*" >&2; exit 1; }
 
 # --- pick a downloader ----------------------------------------------------------------------
 fetch() {
@@ -55,11 +55,30 @@ fi
 
 # --- download + extract ----------------------------------------------------------------------
 command -v tar >/dev/null 2>&1 || die "tar not found on PATH"
-TMP="$(mktemp -d "${TMPDIR:-/tmp}/colab-dfs-ext.XXXXXX")" || die "cannot create temp dir"
+TMP="$(mktemp -d "${TMPDIR:-/tmp}/colab-ext.XXXXXX")" || die "cannot create temp dir"
 trap 'rm -rf "$TMP"' EXIT INT TERM
 
-say "downloading ${REPO}@${REF} ..."
-fetch "$TARBALL_URL" | tar -xz -C "$TMP" || die "download/extract failed ($TARBALL_URL)"
+TARBALL="${TMP}/src.tar.gz"
+DOWNLOADED_REPO=""
+
+if [ -n "$EXPLICIT_REPO" ]; then
+    CANDIDATES="$EXPLICIT_REPO"
+else
+    CANDIDATES="deluxebear/colab-ext deluxebear/colab-dfs-ext"
+fi
+
+for candidate_repo in $CANDIDATES; do
+    url="https://github.com/${candidate_repo}/archive/refs/heads/${REF}.tar.gz"
+    say "downloading ${candidate_repo}@${REF} ..."
+    if fetch "$url" > "$TARBALL" 2>/dev/null && [ -s "$TARBALL" ]; then
+        DOWNLOADED_REPO="$candidate_repo"
+        break
+    fi
+    rm -f "$TARBALL"
+done
+
+[ -n "$DOWNLOADED_REPO" ] || die "download failed for ref '${REF}'"
+tar -xzf "$TARBALL" -C "$TMP" || die "extract failed (${TARBALL})"
 
 SRC_DIR=""
 for d in "$TMP"/*/; do
@@ -69,14 +88,15 @@ done
 
 # --- install ----------------------------------------------------------------------------------
 cd "$SRC_DIR"
-"$PY" install.py || die "install.py failed (run it again with COLAB_DFS_DEBUG=1 for details)"
+"$PY" install.py || die "install.py failed (run it again with COLAB_EXT_DEBUG=1 for details)"
 
 # --- next steps --------------------------------------------------------------------------------
 cat <<'EOF'
 
-[colab-dfs] installed. next steps:
-  1. colab dfs doctor     # verify the wiring
-  2. colab dfs consent    # one-time Google consent (browser opens once)
-  3. colab dfs mount      # browser-free mount, e.g.:  colab dfs mount -s <session>
-[colab-dfs] docs: https://github.com/deluxebear/colab-dfs-ext#readme
+[colab-ext] installed. next steps:
+  1. colab ext doctor            # verify the wiring & multi-account state
+  2. colab account list          # view or add Colab accounts
+  3. colab drive consent         # one-time Google Drive consent (browser opens once)
+  4. colab drivemount -s <name>  # zero-browser Drive mount (enhanced built-in command)
+[colab-ext] legacy aliases (`colab dfs ...`) continue to work.
 EOF

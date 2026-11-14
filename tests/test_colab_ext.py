@@ -1,4 +1,4 @@
-"""Hermetic unit and CLI tests for colab-dfs-ext multi-account & DriveFS support.
+"""Hermetic unit and CLI tests for colab-ext multi-account, DriveFS, and skill support.
 
 All tests isolate filesystem state via COLAB_CLI_CONFIG_DIR in a temporary directory
 and isolate credentials via an in-memory KeyringBackend so the user's real
@@ -28,22 +28,29 @@ REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 if REPO_ROOT not in sys.path:
     sys.path.insert(0, REPO_ROOT)
 
-_loaded_ext = sys.modules.get("colab_dfs_ext")
 _reloaded_repo_ext = False
+for _mod in [
+    k for k in list(sys.modules)
+    if k == "colab_dfs_ext" or k.startswith("colab_dfs_ext.")
+]:
+    del sys.modules[_mod]
+    _reloaded_repo_ext = True
+
+_loaded_ext = sys.modules.get("colab_ext")
 if _loaded_ext is not None and not os.path.abspath(_loaded_ext.__file__).startswith(REPO_ROOT + os.sep):
-    for _mod in [k for k in list(sys.modules) if k == "colab_dfs_ext" or k.startswith("colab_dfs_ext.")]:
+    for _mod in [k for k in list(sys.modules) if k == "colab_ext" or k.startswith("colab_ext.")]:
         del sys.modules[_mod]
     _reloaded_repo_ext = True
 
 import colab_cli.cli as colab_cli_mod  # noqa: E402
-import colab_dfs_ext  # noqa: E402
-from colab_dfs_ext import accounts, cli_hooks, drive_mount, skill_doc  # noqa: E402
+import colab_ext  # noqa: E402
+from colab_ext import accounts, cli_hooks, drive_mount, inject, skill_doc  # noqa: E402
 
-if not os.path.abspath(colab_dfs_ext.__file__).startswith(REPO_ROOT + os.sep):
-    raise RuntimeError(f"Expected repo colab_dfs_ext, got {colab_dfs_ext.__file__}")
+if not os.path.abspath(colab_ext.__file__).startswith(REPO_ROOT + os.sep):
+    raise RuntimeError(f"Expected repo colab_ext, got {colab_ext.__file__}")
 
-if _reloaded_repo_ext or getattr(colab_cli_mod.app, colab_dfs_ext.REGISTERED_ATTR, False) is not True:
-    colab_dfs_ext.register(colab_cli_mod.app, force=True)
+if _reloaded_repo_ext or getattr(colab_cli_mod.app, colab_ext.REGISTERED_ATTR, False) is not True:
+    colab_ext.register(colab_cli_mod.app, force=True)
 
 
 class MemoryKeyring(keyring.backend.KeyringBackend):
@@ -131,7 +138,7 @@ def _write_dfs_creds(
 
 class BaseIsolatedTest(unittest.TestCase):
     def setUp(self) -> None:
-        self.tmpdir = tempfile.mkdtemp(prefix="colab-dfs-test-")
+        self.tmpdir = tempfile.mkdtemp(prefix="colab-ext-test-")
         self.orig_keyring = keyring.get_keyring()
         self.mem_kr = MemoryKeyring()
         keyring.set_keyring(self.mem_kr)
@@ -141,16 +148,17 @@ class BaseIsolatedTest(unittest.TestCase):
             for k in (
                 "COLAB_CLI_CONFIG_DIR",
                 "COLAB_ACCOUNT",
+                "COLAB_DRIVE_ACCOUNT",
                 "COLAB_DFS_ACCOUNT",
+                "COLAB_DRIVE_DEFAULT",
                 "COLAB_DFS_DEFAULT",
                 "COLAB_TOKEN_STORAGE",
             )
         }
         os.environ["COLAB_CLI_CONFIG_DIR"] = self.tmpdir
-        os.environ.pop("COLAB_ACCOUNT", None)
-        os.environ.pop("COLAB_DFS_ACCOUNT", None)
-        os.environ.pop("COLAB_DFS_DEFAULT", None)
-        os.environ.pop("COLAB_TOKEN_STORAGE", None)
+        for k in self._env_backup:
+            if k != "COLAB_CLI_CONFIG_DIR":
+                os.environ.pop(k, None)
 
         self._tok_acct = accounts.ACTIVE_ACCOUNT.set(None)
         self._tok_src = accounts.ACTIVE_SOURCE.set("active")
@@ -186,6 +194,7 @@ class BaseIsolatedTest(unittest.TestCase):
         state._client = None
         state._sessions = None
         state.auth_provider = AuthProvider.OAUTH2
+        state._colab_ext_explicit_config = False
         state._colab_dfs_explicit_config = False
 
 
@@ -562,8 +571,8 @@ class TestMultiAccountCLI(BaseIsolatedTest):
         self.assertEqual(res_clear.exit_code, 0, res_clear.output)
         self.assertIsNone(accounts.load_registry()["accounts"]["compute"]["drive_account"])
 
-        # Headless `colab dfs consent -a headless --url-only` auto-selects `sdk` and writes pending state
-        res_cons = self.runner.invoke(colab_cli_mod.app, ["dfs", "consent", "-a", "headless", "--url-only"])
+        # Headless `colab drive consent -a headless --url-only` auto-selects `sdk` and writes pending state
+        res_cons = self.runner.invoke(colab_cli_mod.app, ["drive", "consent", "-a", "headless", "--url-only"])
         self.assertEqual(res_cons.exit_code, 0, res_cons.output)
         self.assertIn("https://accounts.google.com/", res_cons.stdout)
         dfs_pend = accounts.dfs_pending_path("headless")
@@ -572,10 +581,12 @@ class TestMultiAccountCLI(BaseIsolatedTest):
             pend = json.load(f)
         self.assertEqual(pend["flavor"], "sdk")
 
-        # `colab dfs doctor` preserves `source: active` (not polluted to `env`)
-        res_doc = self.runner.invoke(colab_cli_mod.app, ["dfs", "doctor"])
-        self.assertEqual(res_doc.exit_code, 0, res_doc.output)
-        self.assertIn("active account  : default (source: active,", res_doc.stdout)
+        # `colab ext doctor` and legacy `colab dfs doctor` preserve `source: active`
+        for doc_args in (["ext", "doctor"], ["dfs", "doctor"]):
+            res_doc = self.runner.invoke(colab_cli_mod.app, doc_args)
+            self.assertEqual(res_doc.exit_code, 0, res_doc.output)
+            self.assertIn("colab-ext v", res_doc.stdout)
+            self.assertIn("active account  : default (source: active,", res_doc.stdout)
 
     def test_skill_augmentation_and_url_authuser_clean_stdout(self) -> None:
         # Both `colab skill` and `colab SKILL` return augmented Markdown with valid frontmatter.
@@ -587,7 +598,8 @@ class TestMultiAccountCLI(BaseIsolatedTest):
             second_sep = text.find("\n---", 4)
             self.assertGreater(second_sep, 4)
             self.assertIn("colab account", text)
-            self.assertIn("colab dfs mount", text)
+            self.assertIn("colab drive mount", text)
+            self.assertIn("colab ext doctor", text)
             self.assertIn("--drive-account", text)
             # Idempotent
             self.assertEqual(skill_doc.augment_skill_markdown(text), text)
@@ -611,7 +623,7 @@ class TestMultiAccountCLI(BaseIsolatedTest):
         import base64
         import re
         from colab_cli.commands import automation
-        from colab_dfs_ext import remote
+        from colab_ext import remote
 
         accounts.ensure_bootstrapped()
         accounts.ensure_account("compute", email="compute@example.com")
@@ -694,7 +706,7 @@ class TestMultiAccountCLI(BaseIsolatedTest):
                 ["-a", "nostore", "drivemount", "-s", "n1", "--no-fallback"],
             )
             self.assertEqual(res_no_fb.exit_code, 1, res_no_fb.output)
-            self.assertIn("dfs consent", res_no_fb.stderr)
+            self.assertIn("drive consent", res_no_fb.stderr)
             self.assertEqual(upstream_calls, [])
 
             # 4a. Graceful fallback to upstream when credentials are missing (prints tip + account hint)
@@ -703,7 +715,7 @@ class TestMultiAccountCLI(BaseIsolatedTest):
                 ["-a", "nostore", "drivemount", "-s", "n1"],
             )
             self.assertEqual(res_fb.exit_code, 0, res_fb.output)
-            self.assertIn("dfs consent", res_fb.stderr)
+            self.assertIn("drive consent", res_fb.stderr)
             self.assertIn("nostore@example.com", res_fb.stderr)
             self.assertEqual(len(upstream_calls), 1)
             self.assertEqual(upstream_calls[0][0], "n1")
@@ -717,8 +729,8 @@ class TestMultiAccountCLI(BaseIsolatedTest):
                 self.assertEqual(res_up.exit_code, 0, res_up.output)
                 self.assertEqual(len(upstream_calls), 2)
 
-                # 4c. `COLAB_DFS_DEFAULT=0` forces upstream flow as well
-                os.environ["COLAB_DFS_DEFAULT"] = "0"
+                # 4c. `COLAB_DRIVE_DEFAULT=0` forces upstream flow as well
+                os.environ["COLAB_DRIVE_DEFAULT"] = "0"
                 try:
                     res_env_off = self.runner.invoke(
                         colab_cli_mod.app,
@@ -727,14 +739,125 @@ class TestMultiAccountCLI(BaseIsolatedTest):
                     self.assertEqual(res_env_off.exit_code, 0, res_env_off.output)
                     self.assertEqual(len(upstream_calls), 3)
 
-                    # Reject DriveFS-only option combined with COLAB_DFS_DEFAULT=0
+                    # Reject DriveFS-only option combined with COLAB_DRIVE_DEFAULT=0
                     res_conflict = self.runner.invoke(
                         colab_cli_mod.app,
                         ["-a", "storage", "drivemount", "-s", "st1", "--readonly"],
                     )
                     self.assertEqual(res_conflict.exit_code, 1, res_conflict.output)
                 finally:
-                    os.environ.pop("COLAB_DFS_DEFAULT", None)
+                    os.environ.pop("COLAB_DRIVE_DEFAULT", None)
+
+    def test_ext_drive_dfs_alias_and_legacy_pth_migration(self) -> None:
+        from colab_cli.commands import automation
+        from colab_ext import account_commands, remote
+
+        accounts.ensure_bootstrapped()
+        accounts.ensure_account("work", email="work@example.com")
+        accounts.ensure_account("drv_new", email="drv_new@example.com")
+        accounts.ensure_account("drv_old", email="drv_old@example.com")
+        _write_dfs_creds("work", user_id="101", email="work@example.com", refresh_token="1//work-rt")
+        _write_dfs_creds("drv_new", user_id="202", email="drv_new@example.com", refresh_token="1//new-rt")
+        _write_dfs_creds("drv_old", user_id="303", email="drv_old@example.com", refresh_token="1//old-rt")
+        _write_json(accounts.sessions_path("work"), {"w1": _make_session_dict("w1", "ep-w1")})
+
+        # `colab ext` subcommands (`doctor`, `status`, `version`)
+        for sub in ("doctor", "status"):
+            r_ext = self.runner.invoke(colab_cli_mod.app, ["ext", sub])
+            self.assertEqual(r_ext.exit_code, 0, r_ext.output)
+            self.assertIn("colab-ext v", r_ext.stdout)
+
+        r_ver = self.runner.invoke(colab_cli_mod.app, ["ext", "version"])
+        self.assertEqual(r_ver.exit_code, 0, r_ver.output)
+        ver_data = json.loads(r_ver.stdout)
+        self.assertEqual(ver_data["extension"], colab_ext.__version__)
+
+        # `colab drive` and backward-compatible `colab dfs` alias parity
+        for grp in ("drive", "dfs"):
+            r_show = self.runner.invoke(colab_cli_mod.app, [grp, "show", "-a", "work"])
+            self.assertEqual(r_show.exit_code, 0, r_show.output)
+            self.assertIn('"user_id": "101"', r_show.stdout)
+
+            # Session auto-routing on `mount --dry-run` (omitting `-a`)
+            r_dry = self.runner.invoke(colab_cli_mod.app, [grp, "mount", "--dry-run", "-s", "w1"])
+            self.assertEqual(r_dry.exit_code, 0, r_dry.output)
+            self.assertIn('"colab_account": "work"', r_dry.stdout)
+            self.assertIn("Routing session 'w1' -> account 'work'", r_dry.stderr)
+
+        # `colab drive status` with session auto-routing
+        with mock.patch.object(
+            remote,
+            "exec_code",
+            return_value='DFS_RESULT {"mountpoint": "/content/drive", "mounted": true, "mount_line": [], "drive_procs": "1", "shim_procs": "1", "entries": 3, "official_env": {}}\n',
+        ) as m_exec:
+            r_st = self.runner.invoke(colab_cli_mod.app, ["drive", "status", "-s", "w1"])
+        self.assertEqual(r_st.exit_code, 0, r_st.output)
+        self.assertEqual(m_exec.call_args.args[0], "w1")
+        self.assertIn("account     : work", r_st.stdout)
+
+        # `colab drive consent --url-only`
+        r_cons = self.runner.invoke(colab_cli_mod.app, ["drive", "consent", "-a", "drv_cons", "--url-only"])
+        self.assertEqual(r_cons.exit_code, 0, r_cons.output)
+        self.assertIn("https://accounts.google.com/", r_cons.stdout)
+
+        # `COLAB_DRIVE_ACCOUNT` + legacy `COLAB_DFS_ACCOUNT` resolution
+        os.environ["COLAB_DFS_ACCOUNT"] = "drv_old"
+        try:
+            self.assertEqual(drive_mount.make_cfg(account="work")["drive_account"], "drv_old")
+            os.environ["COLAB_DRIVE_ACCOUNT"] = "drv_new"
+            self.assertEqual(drive_mount.make_cfg(account="work")["drive_account"], "drv_new")
+        finally:
+            os.environ.pop("COLAB_DRIVE_ACCOUNT", None)
+            os.environ.pop("COLAB_DFS_ACCOUNT", None)
+
+        # Legacy `COLAB_DFS_DEFAULT=0` disables zero-browser override in `drivemount`
+        with (
+            mock.patch.object(automation, "run_automation", return_value=None) as m_auto,
+            mock.patch.object(remote, "exec_code", side_effect=AssertionError("must not run DriveFS")),
+        ):
+            os.environ["COLAB_DFS_DEFAULT"] = "0"
+            try:
+                r_leg_off = self.runner.invoke(colab_cli_mod.app, ["-a", "work", "drivemount", "-s", "w1"])
+                self.assertEqual(r_leg_off.exit_code, 0, r_leg_off.output)
+                self.assertEqual(m_auto.call_count, 1)
+            finally:
+                os.environ.pop("COLAB_DFS_DEFAULT", None)
+
+        # `--with-drive/--no-drive` advertised in help; hidden `--no-dfs` alias still honored
+        r_add_help = self.runner.invoke(colab_cli_mod.app, ["account", "add", "--help"])
+        self.assertEqual(r_add_help.exit_code, 0, r_add_help.output)
+        self.assertIn("--with-drive", r_add_help.stdout)
+        self.assertIn("--no-drive", r_add_help.stdout)
+
+        with (
+            mock.patch.object(account_commands, "_interactive_oauth_login", return_value="keyring"),
+            mock.patch.object(
+                account_commands,
+                "_run_dfs_consent_for_account",
+                side_effect=AssertionError("--no-dfs must skip DriveFS consent"),
+            ),
+        ):
+            r_no_dfs = self.runner.invoke(colab_cli_mod.app, ["account", "add", "compat_u", "--no-dfs"])
+            self.assertEqual(r_no_dfs.exit_code, 0, r_no_dfs.output)
+            self.assertIn("compat_u", accounts.load_registry()["accounts"])
+
+        # `inject.ensure` writes `colab_ext.pth` and automatically removes legacy `colab_dfs.pth`
+        fake_site = os.path.join(self.tmpdir, "fake-site-packages")
+        os.makedirs(fake_site, exist_ok=True)
+        legacy_pth = os.path.join(fake_site, "colab_dfs.pth")
+        new_pth = os.path.join(fake_site, "colab_ext.pth")
+        with open(legacy_pth, "w", encoding="utf-8") as f:
+            f.write("# legacy hook\n")
+
+        rep = inject.ensure(site_dir=fake_site, copy_source=False, quiet=True)
+        self.assertEqual(rep["pth"], new_pth)
+        self.assertTrue(os.path.exists(new_pth))
+        self.assertFalse(os.path.exists(legacy_pth))
+        self.assertEqual(rep.get("removed_legacy"), [legacy_pth])
+
+        rm_rep = inject.remove(site_dir=fake_site)
+        self.assertTrue(rm_rep["removed"])
+        self.assertFalse(os.path.exists(new_pth))
 
 
 if __name__ == "__main__":

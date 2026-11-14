@@ -112,7 +112,7 @@ def exec_code(name: str | None, code: str, timeout: int = 180, retries: int = 3)
             if attempt >= retries - 1 or not _is_transient_conn_error(exc, elapsed, float(timeout)):
                 raise
             delay = 2 ** (attempt + 1)
-            print(f"[dfs] kernel connection not ready ({exc}); retrying in {delay}s "
+            print(f"[drive] kernel connection not ready ({exc}); retrying in {delay}s "
                   f"({attempt + 1}/{retries}) ...", file=sys.stderr, flush=True)
             time.sleep(delay)
         finally:
@@ -144,7 +144,7 @@ def _exec_cli(name: str | None, code: str, timeout: int) -> str:
             pass
 
 
-# --- small remote snippets used by `colab dfs status` / `colab dfs umount` -----------------
+# --- small remote snippets used by `colab drive status` / `colab drive umount` -------------
 STATUS_REMOTE = r'''
 import os, subprocess, json
 MP = __MP__

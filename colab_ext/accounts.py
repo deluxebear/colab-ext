@@ -2,7 +2,7 @@
 
 Pure Python 3.8+ standard library at module import time. Optional keyring
 access is performed lazily inside credential functions so CLI startup and
-non-auth commands (`--help`, `account list`, `skill`, `dfs doctor`) never
+non-auth commands (`--help`, `account list`, `skill`, `ext doctor`) never
 block on locked OS keyrings.
 """
 
@@ -835,7 +835,11 @@ def resolve_drive_account(
     if explicit_drive:
         return lookup_account(explicit_drive, reg, allow_create=for_consent), "flag"
 
-    env_drv = (os.environ.get("COLAB_DFS_ACCOUNT") or "").strip()
+    env_drv = (
+        os.environ.get("COLAB_DRIVE_ACCOUNT")
+        or os.environ.get("COLAB_DFS_ACCOUNT")
+        or ""
+    ).strip()
     if env_drv:
         return lookup_account(env_drv, reg, allow_create=for_consent), "env"
 

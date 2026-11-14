@@ -1,4 +1,4 @@
-"""The `colab dfs ...` command group."""
+"""The `colab drive ...` (alias `colab dfs ...`) and `colab ext ...` command groups."""
 
 from __future__ import annotations
 
@@ -15,31 +15,124 @@ from . import __version__
 
 # Keep every command tolerant of unknown flags: they are forwarded to the underlying tool,
 # so the CLI surface can never block access to a flag we did not think to expose.
-EXTRA = {"allow_extra_args": True, "ignore_unknown_options": True,
-         "help_option_names": ["-h", "--help"]}
+EXTRA = {
+    "allow_extra_args": True,
+    "ignore_unknown_options": True,
+    "help_option_names": ["-h", "--help"],
+}
 
-dfs = typer.Typer(name="dfs", no_args_is_help=True,
-                  context_settings={"help_option_names": ["-h", "--help"]})
+drive_app = typer.Typer(
+    name="drive",
+    no_args_is_help=True,
+    context_settings={"help_option_names": ["-h", "--help"]},
+)
+dfs = drive_app  # backward-compatible alias
 
-Session = Annotated[Optional[str], typer.Option("-s", "--session",
-                                                help="colab session name (default: the only running one)")]
-Account = Annotated[Optional[str], typer.Option("-a", "--account",
-                                                help="Colab account profile or email")]
-DriveAccount = Annotated[Optional[str], typer.Option("--drive-account",
-                                                     help="Mount/inspect another profile's Drive credentials")]
-Path = Annotated[str, typer.Argument(help="mountpoint inside the runtime (default /content/drive)")]
+ext_app = typer.Typer(
+    name="ext",
+    no_args_is_help=True,
+    context_settings={"help_option_names": ["-h", "--help"]},
+)
+
+# Module-level Annotated aliases required for Python 3.14 inspect.signature(..., eval_str=True).
+Session = Annotated[
+    Optional[str],
+    typer.Option("-s", "--session", help="colab session name (default: the only running one)"),
+]
+Account = Annotated[
+    Optional[str],
+    typer.Option("-a", "--account", help="Colab account profile or email"),
+]
+DriveAccount = Annotated[
+    Optional[str],
+    typer.Option("--drive-account", help="Mount/inspect another profile's Drive credentials"),
+]
+Path = Annotated[
+    str,
+    typer.Argument(help="mountpoint inside the runtime (default /content/drive)"),
+]
 Timeout = Annotated[int, typer.Option("--timeout", help="seconds to wait for the mount")]
 Force = Annotated[bool, typer.Option("--force", help="remount even if already mounted")]
+ModeOpt = Annotated[
+    str,
+    typer.Option(
+        "--mode",
+        help="shim (default, works with any client's token) | rt (pass --refresh_token to DriveFS)",
+    ),
+]
+ReadonlyOpt = Annotated[bool, typer.Option("--readonly", help="read-only mount")]
+PortOpt = Annotated[int, typer.Option("--port", help="shim port inside the runtime")]
+FromEnvOpt = Annotated[
+    bool,
+    typer.Option("--from-env", help="read COLAB_DRIVE_* env vars instead of the store"),
+]
+CliTokenOpt = Annotated[
+    bool,
+    typer.Option(
+        "--cli-token",
+        help="use the colab-cli token (needs the drive scope; default colab-cli tokens only have drive.file)",
+    ),
+]
+PurgeStateOpt = Annotated[
+    bool,
+    typer.Option("--purge-state", help="delete the runtime's DriveFS local state first"),
+]
+UserIdOpt = Annotated[Optional[str], typer.Option("--user-id", help="account GaiaId override")]
+EmailOpt = Annotated[Optional[str], typer.Option("--email", help="account email override")]
+DriveExtraOpt = Annotated[
+    Optional[list[str]],
+    typer.Option("--drive-extra", help="extra flag for /opt/google/drive/drive"),
+]
+DryRunOpt = Annotated[bool, typer.Option("--dry-run", help="print config + remote payload")]
+ViaCliOpt = Annotated[
+    bool,
+    typer.Option("--via-cli", help="shell out to `colab exec` instead of the kernel API"),
+]
+FlavorOpt = Annotated[
+    Optional[str],
+    typer.Option(
+        "--flavor",
+        help="dfs (default: loopback callback, nothing to copy-paste) | sdk (auto-selected on --url-only) | custom",
+    ),
+]
+MinimalOpt = Annotated[
+    bool,
+    typer.Option("--minimal", help="only openid + email + drive scopes"),
+]
+ConsentPortOpt = Annotated[int, typer.Option("--port", help="loopback port (0 = auto)")]
+LoginHintOpt = Annotated[
+    Optional[str],
+    typer.Option("--login-hint", help="Google login_hint email pre-selected in browser"),
+]
+CodeOpt = Annotated[
+    Optional[str],
+    typer.Option("--code", help="finish a --url-only flow later"),
+]
+UrlOnlyOpt = Annotated[
+    bool,
+    typer.Option("--url-only", help="print the consent URL and exit"),
+]
+NoBrowserOpt = Annotated[bool, typer.Option("--no-browser", help="do not open the browser")]
+WhoamiOpt = Annotated[
+    bool,
+    typer.Option("--whoami", help="also refresh/record user_id + email"),
+]
+JsonOutOpt = Annotated[bool, typer.Option("--json", help="machine-readable output")]
+SiteDirOpt = Annotated[
+    Optional[str],
+    typer.Option("--site-dir", help="site-packages to write the .pth into"),
+]
+QuietOpt = Annotated[bool, typer.Option("--quiet")]
 
 
-def _activate_dfs_account(
+def _activate_account(
     account: Optional[str],
     *,
     session: Optional[str] = None,
     allow_routing: bool = False,
     allow_create: bool = False,
 ) -> str:
-    """Resolve and bind the active account + colab_cli state for `colab dfs` commands."""
+    """Resolve and bind the active account + colab_cli state for extension commands."""
     from . import accounts
 
     if account is None and accounts.ACTIVE_ACCOUNT.get() is not None:
@@ -53,7 +146,7 @@ def _activate_dfs_account(
                 allow_create=allow_create,
             )
         except accounts.AccountError as exc:
-            typer.echo(f"[dfs] {exc}", err=True)
+            typer.echo(f"[drive] {exc}", err=True)
             raise typer.Exit(code=1)
         accounts.ACTIVE_ACCOUNT.set(acct)
         accounts.ACTIVE_SOURCE.set(src)
@@ -61,7 +154,10 @@ def _activate_dfs_account(
     try:
         from colab_cli.common import state
 
-        if not getattr(state, "_colab_dfs_explicit_config", False):
+        explicit = getattr(state, "_colab_ext_explicit_config", False) or getattr(
+            state, "_colab_dfs_explicit_config", False
+        )
+        if not explicit:
             target = accounts.sessions_path(acct)
             if getattr(state, "config_path", None) != target:
                 state.config_path = target
@@ -74,12 +170,22 @@ def _activate_dfs_account(
     return acct
 
 
-@dfs.callback()
-def _dfs_callback(ctx: typer.Context, account: Account = None):
-    """Apply `colab dfs -a <account>` if passed before the dfs subcommand."""
+_activate_dfs_account = _activate_account  # internal compatibility alias
+
+
+@drive_app.callback()
+def _drive_callback(ctx: typer.Context, account: Account = None):
+    """Apply `colab drive -a <account>` if passed before the drive subcommand."""
     if account is not None:
         allow_create = getattr(ctx, "invoked_subcommand", None) == "consent"
-        _activate_dfs_account(account, allow_create=allow_create)
+        _activate_account(account, allow_create=allow_create)
+
+
+@ext_app.callback()
+def _ext_callback(account: Account = None):
+    """Apply `colab ext -a <account>` if passed before the ext subcommand."""
+    if account is not None:
+        _activate_account(account, allow_create=False)
 
 
 # --- mount --------------------------------------------------------------------------------
@@ -97,11 +203,15 @@ def _run_mount(cfg: dict, session: Optional[str], verbose: bool = True) -> int:
                 if drive_acct != colab_acct
                 else str(colab_acct)
             )
-            print("[dfs] %s (%s) -> %s (%s mode), browser-free ..."
-                  % (name, acct_tag, cfg["mountpoint"], cfg["mode"]))
+            print(
+                "[drive] %s (%s) -> %s (%s mode), browser-free ..."
+                % (name, acct_tag, cfg["mountpoint"], cfg["mode"])
+            )
         else:
-            print("[dfs] %s -> %s (%s mode), browser-free ..."
-                  % (name, cfg["mountpoint"], cfg["mode"]))
+            print(
+                "[drive] %s -> %s (%s mode), browser-free ..."
+                % (name, cfg["mountpoint"], cfg["mode"])
+            )
     t0 = time.time()
     text = remote.exec_code(name, drive_mount.payload(cfg), int(cfg["timeout"]) + 90)
     res = drive_mount.parse_result(text)
@@ -139,68 +249,84 @@ def _run_mount(cfg: dict, session: Optional[str], verbose: bool = True) -> int:
             pass
         if verbose:
             if res.get("note"):
-                print("[dfs] OK: %s" % res["note"])
+                print("[drive] OK: %s" % res["note"])
             else:
-                print("[dfs] OK in %.1fs: Drive at %s (%s entries top-level, mode=%s)"
-                      % (time.time() - t0, mp,
-                         res.get("entries"), res.get("mode") or cfg["mode"]))
+                print(
+                    "[drive] OK in %.1fs: Drive at %s (%s entries top-level, mode=%s)"
+                    % (
+                        time.time() - t0,
+                        mp,
+                        res.get("entries"),
+                        res.get("mode") or cfg["mode"],
+                    )
+                )
             if res.get("shim"):
-                print("[dfs] creds shim: %s  (keep the runtime alive; it re-serves tokens)"
-                      % res["shim"])
+                print(
+                    "[drive] creds shim: %s  (keep the runtime alive; it re-serves tokens)"
+                    % res["shim"]
+                )
         return 0
     if res:
-        print("[dfs] FAILED: %s" % json.dumps(res, indent=2)[:4000])
+        print("[drive] FAILED: %s" % json.dumps(res, indent=2)[:4000])
         for key in ("drive_log", "dfs_log_errors", "log", "error", "hint"):
             if res.get(key):
                 print("--- %s ---\n%s" % (key, res[key]))
     else:
-        print("[dfs] the payload produced no DFS_RESULT; kernel output:\n%s" % text[-3000:])
+        print("[drive] the payload produced no DFS_RESULT; kernel output:\n%s" % text[-3000:])
     return 1
 
 
-@dfs.command(context_settings=EXTRA)
+@drive_app.command(context_settings=EXTRA)
 def mount(
     ctx: typer.Context,
     session: Session = None,
     account: Account = None,
     drive_account: DriveAccount = None,
     path: Path = "/content/drive",
-    mode: Annotated[str, typer.Option("--mode", help="shim (default, works with any client's token)"
-                                           " | rt (pass --refresh_token to DriveFS)")] = "shim",
+    mode: ModeOpt = "shim",
     force: Force = False,
-    readonly: Annotated[bool, typer.Option("--readonly", help="read-only mount")] = False,
+    readonly: ReadonlyOpt = False,
     timeout: Timeout = 120,
-    port: Annotated[int, typer.Option("--port", help="shim port inside the runtime")] = 8012,
-    from_env: Annotated[bool, typer.Option("--from-env",
-                                           help="read COLAB_DRIVE_* env vars instead of the store")] = False,
-    cli_token: Annotated[bool, typer.Option("--cli-token",
-                                            help="use the colab-cli token (needs the drive scope; "
-                                                 "default colab-cli tokens only have drive.file)")] = False,
-    purge_state: Annotated[bool, typer.Option("--purge-state",
-                                              help="delete the runtime's DriveFS local state first")] = False,
-    user_id: Annotated[Optional[str], typer.Option("--user-id", help="account GaiaId override")] = None,
-    email: Annotated[Optional[str], typer.Option("--email", help="account email override")] = None,
-    drive_extra: Annotated[Optional[list[str]], typer.Option("--drive-extra",
-                                                            help="extra flag for /opt/google/drive/drive")] = None,
-    dry_run: Annotated[bool, typer.Option("--dry-run", help="print config + remote payload")] = False,
-    via_cli: Annotated[bool, typer.Option("--via-cli",
-                                          help="shell out to `colab exec` instead of the kernel API")] = False,
+    port: PortOpt = 8012,
+    from_env: FromEnvOpt = False,
+    cli_token: CliTokenOpt = False,
+    purge_state: PurgeStateOpt = False,
+    user_id: UserIdOpt = None,
+    email: EmailOpt = None,
+    drive_extra: DriveExtraOpt = None,
+    dry_run: DryRunOpt = False,
+    via_cli: ViaCliOpt = False,
 ):
     """Mount Google Drive in the runtime with no browser and no dfs_ephemeral consent."""
     from . import drive_mount
 
     if " " in path:
         raise typer.BadParameter("mountpoint must not contain a space")
-    acct = _activate_dfs_account(account, session=session, allow_routing=True)
-    argv = ["--account", acct, "--path", path, "--mode", mode,
-            "--timeout", str(timeout), "--port", str(port)]
+    acct = _activate_account(account, session=session, allow_routing=True)
+    argv = [
+        "--account",
+        acct,
+        "--path",
+        path,
+        "--mode",
+        mode,
+        "--timeout",
+        str(timeout),
+        "--port",
+        str(port),
+    ]
     if drive_account:
         argv += ["--drive-account", drive_account]
     if session:
         argv += ["-s", session]
-    for flag, on in (("--force", force), ("--readonly", readonly), ("--from-env", from_env),
-                     ("--cli-token", cli_token), ("--purge-state", purge_state),
-                     ("--dry-run", dry_run)):
+    for flag, on in (
+        ("--force", force),
+        ("--readonly", readonly),
+        ("--from-env", from_env),
+        ("--cli-token", cli_token),
+        ("--purge-state", purge_state),
+        ("--dry-run", dry_run),
+    ):
         if on:
             argv.append(flag)
     for flag, val in (("--user-id", user_id), ("--email", email)):
@@ -213,16 +339,27 @@ def mount(
     if dry_run or via_cli:
         raise typer.Exit(code=drive_mount.main(argv))
 
-    cfg = drive_mount.make_cfg(session=session, path=path, mode=mode, force=force,
-                               readonly=readonly, timeout=timeout, port=port,
-                               cli_token=cli_token, from_env=from_env,
-                               drive_extra=drive_extra or [], purge_state=purge_state,
-                               user_id=user_id, email=email,
-                               account=acct, drive_account=drive_account)
+    cfg = drive_mount.make_cfg(
+        session=session,
+        path=path,
+        mode=mode,
+        force=force,
+        readonly=readonly,
+        timeout=timeout,
+        port=port,
+        cli_token=cli_token,
+        from_env=from_env,
+        drive_extra=drive_extra or [],
+        purge_state=purge_state,
+        user_id=user_id,
+        email=email,
+        account=acct,
+        drive_account=drive_account,
+    )
     raise typer.Exit(code=_run_mount(cfg, session))
 
 
-@dfs.command(context_settings=EXTRA)
+@drive_app.command(context_settings=EXTRA)
 def umount(
     session: Session = None,
     account: Account = None,
@@ -231,20 +368,26 @@ def umount(
     """Unmount Drive (and stop the in-runtime creds shim / drive processes)."""
     from . import remote
 
-    _activate_dfs_account(account, session=session, allow_routing=True)
+    _activate_account(account, session=session, allow_routing=True)
     name = remote.resolve_session(session)
     out = remote.exec_code(name, remote.render(remote.UMOUNT_REMOTE, path), timeout=120)
     line = [l for l in out.splitlines() if l.startswith("DFS_RESULT ")]
     if line:
-        res = json.loads(line[0][len("DFS_RESULT "):])
-        print("[dfs] %s %s (%s)" % (name, "unmounted" if not res.get("mounted") else "STILL MOUNTED",
-                                    res.get("mountpoint")))
+        res = json.loads(line[0][len("DFS_RESULT ") :])
+        print(
+            "[drive] %s %s (%s)"
+            % (
+                name,
+                "unmounted" if not res.get("mounted") else "STILL MOUNTED",
+                res.get("mountpoint"),
+            )
+        )
         raise typer.Exit(code=0 if not res.get("mounted") else 1)
     print(out[-2000:])
     raise typer.Exit(code=1)
 
 
-@dfs.command(context_settings=EXTRA)
+@drive_app.command(context_settings=EXTRA)
 def status(
     session: Session = None,
     account: Account = None,
@@ -254,11 +397,11 @@ def status(
     """Is it mounted? Who is serving tokens? What does the runtime see?"""
     from . import accounts, remote
 
-    acct = _activate_dfs_account(account, session=session, allow_routing=True)
+    acct = _activate_account(account, session=session, allow_routing=True)
     try:
         drive_acct, drive_src = accounts.resolve_drive_account(acct, explicit_drive=drive_account)
     except accounts.AccountError as exc:
-        typer.echo(f"[dfs] {exc}", err=True)
+        typer.echo(f"[drive] {exc}", err=True)
         raise typer.Exit(code=1)
 
     name = remote.resolve_session(session)
@@ -267,11 +410,13 @@ def status(
     if not line:
         print(out[-2000:])
         raise typer.Exit(code=1)
-    res = json.loads(line[0][len("DFS_RESULT "):])
+    res = json.loads(line[0][len("DFS_RESULT ") :])
     print("account     : %s (drive: %s [%s])" % (acct, drive_acct, drive_src))
     print("session     : %s" % name)
-    print("mountpoint  : %s  %s" % (res.get("mountpoint"),
-                                    "MOUNTED" if res.get("mounted") else "not mounted"))
+    print(
+        "mountpoint  : %s  %s"
+        % (res.get("mountpoint"), "MOUNTED" if res.get("mounted") else "not mounted")
+    )
     for l in res.get("mount_line") or []:
         print("fuse        : %s" % l.strip()[:150])
     print("My Drive    : %s entries" % res.get("entries"))
@@ -280,33 +425,34 @@ def status(
         print("shim log    : %s" % str(res["shim_log"]).replace("\n", " | ")[:200])
     print("colab env   : %s" % json.dumps(res.get("official_env") or {}))
     creds = accounts.dfs_store_path(drive_acct)
-    print("local creds : %s (%s)" % (creds, "present" if os.path.exists(creds)
-                                     else f"MISSING -> run `colab dfs consent -a {drive_acct}`"))
+    print(
+        "local creds : %s (%s)"
+        % (
+            creds,
+            "present" if os.path.exists(creds) else f"MISSING -> run `colab drive consent -a {drive_acct}`",
+        )
+    )
 
 
 # --- credentials --------------------------------------------------------------------------
-@dfs.command(context_settings=EXTRA)
+@drive_app.command(context_settings=EXTRA)
 def consent(
     ctx: typer.Context,
     account: Account = None,
-    flavor: Annotated[Optional[str], typer.Option("--flavor",
-                                                  help="dfs (default: loopback callback, nothing to "
-                                                       "copy-paste) | sdk (auto-selected on --url-only) "
-                                                       "| custom")] = None,
-    minimal: Annotated[bool, typer.Option("--minimal", help="only openid + email + drive scopes")] = True,
-    port: Annotated[int, typer.Option("--port", help="loopback port (0 = auto)")] = 0,
-    user_id: Annotated[Optional[str], typer.Option("--user-id", help="account GaiaId")] = None,
-    email: Annotated[Optional[str], typer.Option("--email", help="account email")] = None,
-    login_hint: Annotated[Optional[str], typer.Option("--login-hint",
-                                                      help="Google login_hint email pre-selected in browser")] = None,
-    code: Annotated[Optional[str], typer.Option("--code", help="finish a --url-only flow later")] = None,
-    url_only: Annotated[bool, typer.Option("--url-only", help="print the consent URL and exit")] = False,
-    no_browser: Annotated[bool, typer.Option("--no-browser", help="do not open the browser")] = False,
+    flavor: FlavorOpt = None,
+    minimal: MinimalOpt = True,
+    port: ConsentPortOpt = 0,
+    user_id: UserIdOpt = None,
+    email: EmailOpt = None,
+    login_hint: LoginHintOpt = None,
+    code: CodeOpt = None,
+    url_only: UrlOnlyOpt = False,
+    no_browser: NoBrowserOpt = False,
 ):
     """One-time Google consent -> refresh token in accounts/<account>/dfs_credentials.json."""
     from . import dfs_creds
 
-    acct = _activate_dfs_account(account, allow_create=True)
+    acct = _activate_account(account, allow_create=True)
     argv = ["consent", "--account", acct]
     if flavor is not None:
         argv += ["--flavor", flavor]
@@ -315,8 +461,12 @@ def consent(
     if minimal:
         argv.append("--minimal")
     argv += ["--port", str(port)]
-    for flag, val in (("--user-id", user_id), ("--email", email),
-                      ("--login-hint", login_hint), ("--code", code)):
+    for flag, val in (
+        ("--user-id", user_id),
+        ("--email", email),
+        ("--login-hint", login_hint),
+        ("--code", code),
+    ):
         if val:
             argv += [flag, val]
     for flag, on in (("--url-only", url_only), ("--no-browser", no_browser)):
@@ -331,7 +481,7 @@ def consent(
         raise typer.Exit(code=int(exc.code or 0))
 
 
-@dfs.command(context_settings=EXTRA)
+@drive_app.command(context_settings=EXTRA)
 def show(
     account: Account = None,
     drive_account: DriveAccount = None,
@@ -339,7 +489,7 @@ def show(
     """Summarise the stored refresh token (never prints the secret)."""
     from . import dfs_creds
 
-    acct = _activate_dfs_account(account)
+    acct = _activate_account(account)
     argv = ["show", "--account", acct]
     if drive_account:
         argv += ["--drive-account", drive_account]
@@ -349,17 +499,17 @@ def show(
         raise typer.Exit(code=int(exc.code or 0))
 
 
-@dfs.command(context_settings=EXTRA)
+@drive_app.command(context_settings=EXTRA)
 def token(
     account: Account = None,
     drive_account: DriveAccount = None,
-    whoami: Annotated[bool, typer.Option("--whoami", help="also refresh/record user_id + email")] = False,
-    json_out: Annotated[bool, typer.Option("--json", help="machine-readable output")] = False,
+    whoami: WhoamiOpt = False,
+    json_out: JsonOutOpt = False,
 ):
     """Mint (and cache-check) an access token right now -- proves the refresh token works."""
     from . import dfs_creds
 
-    acct = _activate_dfs_account(account)
+    acct = _activate_account(account)
     argv = ["token", "--account", acct]
     if drive_account:
         argv += ["--drive-account", drive_account]
@@ -373,24 +523,24 @@ def token(
         raise typer.Exit(code=int(exc.code or 0))
 
 
-@dfs.command(context_settings=EXTRA)
+@drive_app.command(context_settings=EXTRA)
 def clear(account: Account = None):
     """Delete stored DriveFS refresh credentials for an account."""
     from . import dfs_creds
 
-    acct = _activate_dfs_account(account)
+    acct = _activate_account(account)
     try:
         dfs_creds.main(["clear", "--account", acct])
     except SystemExit as exc:
         raise typer.Exit(code=int(exc.code or 0))
 
 
-# --- plumbing ----------------------------------------------------------------------------─
-@dfs.command(context_settings=EXTRA)
+# --- extension plumbing (`colab ext ...`, with hidden legacy aliases on `colab drive/dfs`) -
+@ext_app.command(name="install", context_settings=EXTRA)
+@drive_app.command(name="install", context_settings=EXTRA, hidden=True)
 def install(
-    site_dir: Annotated[Optional[str], typer.Option("--site-dir",
-                                                    help="site-packages to write the .pth into")] = None,
-    quiet: Annotated[bool, typer.Option("--quiet")] = False,
+    site_dir: SiteDirOpt = None,
+    quiet: QuietOpt = False,
 ):
     """(Re-)inject this extension into the colab-cli environment. Run after an upgrade."""
     from . import inject
@@ -400,13 +550,20 @@ def install(
         typer.echo("ERROR: %s" % rep["error"], err=True)
         raise typer.Exit(code=1)
     if not quiet:
-        typer.echo("[colab-dfs] .pth : %s (%s)"
-                   % (rep.get("pth"), "updated" if rep.get("changed") else "already there"))
-        typer.echo("[colab-dfs] source: %s" % rep.get("source"))
-        typer.echo("[colab-dfs] `colab dfs` is available in the NEXT colab invocation.")
+        typer.echo(
+            "[colab-ext] .pth : %s (%s)"
+            % (rep.get("pth"), "updated" if rep.get("changed") else "already there")
+        )
+        typer.echo("[colab-ext] source: %s" % rep.get("source"))
+        typer.echo(
+            "[colab-ext] extension commands (`colab account`, `colab drive`, `colab ext`) "
+            "are available in the NEXT colab invocation."
+        )
 
 
-@dfs.command(context_settings=EXTRA)
+@ext_app.command(name="doctor", context_settings=EXTRA)
+@ext_app.command(name="status", context_settings=EXTRA, hidden=True)
+@drive_app.command(name="doctor", context_settings=EXTRA, hidden=True)
 def doctor(
     account: Account = None,
     drive_account: DriveAccount = None,
@@ -414,7 +571,7 @@ def doctor(
     """Diagnose the injection, multi-account setup, credentials, and runtime state."""
     from . import accounts, inject
 
-    acct = _activate_dfs_account(account)
+    acct = _activate_account(account)
     reg = accounts.load_registry()
     acct_map = reg.get("accounts", {})
     acct_names = list(acct_map.keys())
@@ -423,30 +580,40 @@ def doctor(
     try:
         drive_acct, drive_src = accounts.resolve_drive_account(acct, explicit_drive=drive_account)
     except accounts.AccountError as exc:
-        typer.echo(f"[dfs] {exc}", err=True)
+        typer.echo(f"[colab-ext] {exc}", err=True)
         raise typer.Exit(code=1)
 
     st = inject.status()
-    print("colab dfs extension v%s" % __version__)
+    print("colab-ext v%s" % __version__)
     print("  registered here : %s" % ("yes" if inject.reload_ok() else "no (fresh process needed)"))
     print("  colab shim      : %s" % st["colab_shim"])
     print("  interpreter     : %s" % st["python"])
-    print("  site-packages   : %s%s" % (st["site_packages"],
-                                        "" if st["colab_cli_here"] else "  <- colab_cli NOT here"))
+    print(
+        "  site-packages   : %s%s"
+        % (st["site_packages"], "" if st["colab_cli_here"] else "  <- colab_cli NOT here")
+    )
     print("  hook (.pth)     : %s  [%s]" % (st["pth"], "ok" if st["pth_present"] else "MISSING"))
     print("  extension source: %s" % (st["source"] or "MISSING"))
     if not st["pth_present"]:
-        print("\n  fix: python3 %s/install.py   (or `colab dfs install`)"
-              % (st["source"] or "~/.colab-dfs-ext"))
+        print(
+            "\n  fix: python3 %s/install.py   (or `colab ext install`)"
+            % (st["source"] or "~/.colab-ext")
+        )
 
-    print("  accounts file   : %s (%d account(s): %s)"
-          % (accounts.registry_path(), len(acct_names), ", ".join(acct_names) or "none"))
-    print("  active account  : %s (source: %s, email: %s)"
-          % (acct, accounts.current_account_source(), meta.get("email") or "unknown"))
+    print(
+        "  accounts file   : %s (%d account(s): %s)"
+        % (accounts.registry_path(), len(acct_names), ", ".join(acct_names) or "none")
+    )
+    print(
+        "  active account  : %s (source: %s, email: %s)"
+        % (acct, accounts.current_account_source(), meta.get("email") or "unknown")
+    )
     ready = auth_info.get("ready")
     auth_state = "ready" if ready is True else ("unknown" if ready is None else "MISSING")
-    print("  colab auth      : %s (%s via %s: %s)"
-          % (auth_state, auth_info.get("provider"), auth_info.get("storage"), auth_info.get("detail")))
+    print(
+        "  colab auth      : %s (%s via %s: %s)"
+        % (auth_state, auth_info.get("provider"), auth_info.get("storage"), auth_info.get("detail"))
+    )
     print("  drive account   : %s (%s)" % (drive_acct, drive_src))
 
     creds = accounts.dfs_store_path(drive_acct)
@@ -459,20 +626,26 @@ def doctor(
             print("  scopes          : %s" % " ".join(data.get("scopes", []))[:150])
             print("  user id / email : %s / %s" % (data.get("user_id"), data.get("email")))
             if not data.get("user_id"):
-                print("  WARN: no user_id -> DriveFS will CANNOT_START_CORE; "
-                      "re-run `colab dfs consent -a %s`" % drive_acct)
+                print(
+                    "  WARN: no user_id -> DriveFS will CANNOT_START_CORE; "
+                    "re-run `colab drive consent -a %s`" % drive_acct
+                )
             if "drive" not in " ".join(data.get("scopes", [])):
                 print("  WARN: no full drive scope -> DriveFS 403 insufficient_scope")
         except Exception as exc:
             print("  credentials     : unreadable: %r" % exc)
     else:
-        print("  credentials     : MISSING -> run `colab dfs consent -a %s`" % drive_acct)
+        print("  credentials     : MISSING -> run `colab drive consent -a %s`" % drive_acct)
     next_acct = f" -a {acct}" if acct != reg.get("active") else ""
     next_drv = f" --drive-account {drive_acct}" if drive_account else ""
-    print("\n  next step       : colab dfs mount%s%s -s <session>" % (next_acct, next_drv))
+    print(
+        "\n  next step       : colab drivemount%s%s -s <session>  (or colab drive mount%s%s -s <session>)"
+        % (next_acct, next_drv, next_acct, next_drv)
+    )
 
 
-@dfs.command(context_settings=EXTRA)
+@ext_app.command(name="version", context_settings=EXTRA)
+@drive_app.command(name="version", context_settings=EXTRA, hidden=True)
 def version():
     """Extension version + where it came from."""
     from . import inject

@@ -97,7 +97,7 @@ except ImportError:  # standalone execution outside the package
     _ext_parent = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     if _ext_parent not in sys.path:
         sys.path.insert(0, _ext_parent)
-    from colab_dfs_ext import accounts  # type: ignore[no-redef]
+    from colab_ext import accounts  # type: ignore[no-redef]
 
 # --------------------------------------------------------------------------------------
 
@@ -153,7 +153,7 @@ def _in_cli() -> bool:
 def _mount_hint(account: Optional[str] = None) -> str:
     if _in_cli():
         prefix = f"colab -a {account} " if account and account != accounts.DEFAULT_ACCOUNT else "colab "
-        return f"{prefix}dfs mount -s <session>"
+        return f"{prefix}drive mount -s <session>"
     acct_arg = f" -a {account}" if account else ""
     return f"python3 drive_mount.py{acct_arg} -s <session>"
 
@@ -355,7 +355,7 @@ def do_consent(args) -> None:
             print(auth_url)
             if _in_cli():
                 acct_flag = f"-a {drv_acct} " if drv_acct != accounts.DEFAULT_ACCOUNT else ""
-                finish_cmd = f"colab {acct_flag}dfs consent --code <PASTED_CODE>"
+                finish_cmd = f"colab {acct_flag}drive consent --code <PASTED_CODE>"
             else:
                 acct_flag = f" --account {drv_acct}" if drv_acct != accounts.DEFAULT_ACCOUNT else ""
                 finish_cmd = f"python3 {os.path.basename(__file__)} consent{acct_flag} --code <PASTED_CODE>"
