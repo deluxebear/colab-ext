@@ -11,8 +11,10 @@ from __future__ import annotations
 
 import os
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 REGISTERED_ATTR = "_colab_dfs_registered"
+
+ACCOUNT_HELP = "Manage multiple Google accounts, isolated sessions, and shared Drive bindings."
 
 DFS_HELP = (
     "Browser-free Drive mounting (DriveFS + your own refresh token).\n\n"
@@ -23,19 +25,25 @@ DFS_HELP = (
 
 
 def register(app, wrap_update: bool = True, force: bool = False) -> bool:
-    """Attach the `dfs` command group to a Typer app. Never raises; returns True if added."""
+    """Attach multi-account hooks, `account`, and `dfs` to a Typer app. Never raises."""
     if getattr(app, REGISTERED_ATTR, False) and not force:
         return False
     try:
+        from . import cli_hooks
+        from .account_commands import account_app
         from .commands import dfs
 
+        cli_hooks.install_hooks(app, force=force)
+        if force:
+            app.registered_groups = [
+                g for g in getattr(app, "registered_groups", [])
+                if getattr(g, "name", None) not in ("account", "acct", "dfs")
+            ]
+        app.add_typer(account_app, name="account", help=ACCOUNT_HELP)
+        app.add_typer(account_app, name="acct", help=ACCOUNT_HELP, hidden=True)
         app.add_typer(dfs, name="dfs", help=DFS_HELP)
         if wrap_update:
             _wrap_update(app)
-        # Opt-in: make the stock `colab drivemount` use the browser-free path, falling back
-        # to the upstream implementation whenever our credentials are missing/unusable.
-        if os.environ.get("COLAB_DFS_DEFAULT", "").lower() in ("1", "true", "yes", "on"):
-            _wrap_drivemount(app)
         setattr(app, REGISTERED_ATTR, True)
         return True
     except Exception as exc:  # a broken extension must never take the CLI down
@@ -79,36 +87,4 @@ def _wrap_update(app) -> None:
         import functools
 
         reg.callback = functools.wraps(original)(wrapper) if hasattr(original, "__name__") else wrapper
-        return
-
-
-def _wrap_drivemount(app) -> None:
-    """Make `colab drivemount` prefer the browser-free path (COLAB_DFS_DEFAULT=1)."""
-    for reg in list(getattr(app, "registered_commands", []) or []):
-        cb = getattr(reg, "callback", None)
-        name = getattr(reg, "name", None) or getattr(cb, "__name__", "")
-        if name != "drivemount" or cb is None or getattr(cb, "_colab_dfs_wrapped", False):
-            continue
-
-        def wrapper(*args, **kwargs):
-            from . import drive_mount
-
-            session = kwargs.get("session")
-            path = kwargs.get("path") or "/content/drive"
-            try:
-                cfg = drive_mount.make_cfg(session=session, path=path)
-            except SystemExit as exc:  # no credentials yet -> upstream flow
-                print("[colab-dfs] falling back to `colab drivemount` (%s)" % exc)
-                return cb(*args, **kwargs)
-            except Exception as exc:
-                print("[colab-dfs] falling back to `colab drivemount` (%r)" % exc)
-                return cb(*args, **kwargs)
-            from .commands import _run_mount
-
-            _run_mount(cfg, session, verbose=True)
-
-        wrapper._colab_dfs_wrapped = True
-        import functools
-
-        reg.callback = functools.wraps(cb)(wrapper)
         return

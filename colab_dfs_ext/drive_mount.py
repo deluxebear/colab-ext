@@ -26,6 +26,14 @@ import sys
 import tempfile
 import time
 
+try:
+    from . import accounts  # type: ignore[no-redef]
+except ImportError:  # standalone execution outside the package
+    _ext_parent = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    if _ext_parent not in sys.path:
+        sys.path.insert(0, _ext_parent)
+    from colab_dfs_ext import accounts  # type: ignore[no-redef]
+
 STORE = os.path.expanduser("~/.config/colab-cli/dfs_credentials.json")
 CLI_TOKEN = os.path.expanduser("~/.config/colab-cli/token.json")
 
@@ -279,12 +287,37 @@ result(False, stage="drive", rc=proc.poll(), mode=MODE, drive_log=sh("tail -c 12
 '''
 
 
+def _resolve_cfg_accounts(args) -> tuple[str, str]:
+    try:
+        colab_acct, _ = accounts.resolve_account(
+            getattr(args, "account", None),
+            session_name=getattr(args, "session", None),
+            allow_session_routing=True,
+        )
+        drive_acct, _ = accounts.resolve_drive_account(
+            colab_acct,
+            getattr(args, "drive_account", None),
+            for_consent=False,
+        )
+    except accounts.AccountError as exc:
+        sys.exit(str(exc))
+    return colab_acct, drive_acct
+
+
 def build_cfg(args) -> dict:
     env = os.environ.get
+    colab_acct, drive_acct = _resolve_cfg_accounts(args)
+
     if args.cli_token:
-        if not os.path.exists(CLI_TOKEN):
-            sys.exit(f"--cli-token needs {CLI_TOKEN}")
-        tok = json.load(open(CLI_TOKEN))
+        tok = None
+        tok_json, _ = accounts.get_colab_oauth_token(colab_acct)
+        if tok_json:
+            tok = json.loads(tok_json)
+        elif os.path.exists(CLI_TOKEN):
+            with open(CLI_TOKEN, encoding="utf-8") as f:
+                tok = json.load(f)
+        if not tok:
+            sys.exit(f"--cli-token needs stored OAuth token for '{colab_acct}' or {CLI_TOKEN}")
         return {
             "mode": "shim",
             "mountpoint": args.path,
@@ -303,6 +336,8 @@ def build_cfg(args) -> dict:
             "email": args.email or os.environ.get("DFS_EMAIL", ""),
             "drive_extra": args.drive_extra,
             "purge_state": args.purge_state,
+            "colab_account": colab_acct,
+            "drive_account": colab_acct,
         }
     # --- CI / env-var mode: COLAB_DRIVE_REFRESH_TOKEN (+ client) beats the store file ---
     if env("COLAB_DRIVE_REFRESH_TOKEN") or args.from_env:
@@ -331,12 +366,18 @@ def build_cfg(args) -> dict:
             "email": args.email or env("COLAB_DRIVE_EMAIL", ""),
             "drive_extra": args.drive_extra,
             "purge_state": args.purge_state,
+            "colab_account": colab_acct,
+            "drive_account": drive_acct,
         }
-    if not os.path.exists(STORE):
-        sys.exit(f"no credentials in {STORE}\nrun:  {_consent_hint()}")
-    data = json.load(open(STORE))
+
+    store_file = accounts.dfs_store_path(drive_acct)
+    if not os.path.exists(store_file):
+        sys.exit(f"no credentials for drive account '{drive_acct}' at {store_file}\n"
+                 f"run:  {_consent_hint(drive_acct)}")
+    with open(store_file, encoding="utf-8") as f:
+        data = json.load(f)
     if not data.get("refresh_token"):
-        sys.exit(f"incomplete credentials in {STORE}; run `{_consent_hint()}`")
+        sys.exit(f"incomplete credentials in {store_file}; run `{_consent_hint(drive_acct)}`")
     if not data.get("user_id") and not (args.user_id or env("COLAB_DRIVE_USER_ID")):
         sys.exit("user_id missing (needed by DriveFS): pass --user-id <GaiaId>, set "
                  "COLAB_DRIVE_USER_ID, or run `dfs_creds.py consent` with the openid scope")
@@ -356,11 +397,15 @@ def build_cfg(args) -> dict:
         "email": args.email or env("COLAB_DRIVE_EMAIL", "") or data.get("email", ""),
         "drive_extra": args.drive_extra,
         "purge_state": args.purge_state,
+        "colab_account": colab_acct,
+        "drive_account": drive_acct,
     }
 
 
 def main(argv=None) -> None:
     ap = argparse.ArgumentParser(description="browser-free google.colab.drive.mount")
+    ap.add_argument("-a", "--account", help="colab account profile name or email")
+    ap.add_argument("--drive-account", help="storage account supplying Drive credentials")
     ap.add_argument("-s", "--session", help="colab session name (default: the only running one)")
     ap.add_argument("--path", default="/content/drive", help="mountpoint (default /content/drive)")
     ap.add_argument("--mode", choices=["shim", "rt"], default="shim",
@@ -404,9 +449,11 @@ def main(argv=None) -> None:
            "-f", payload]
     if args.session:
         cmd += ["-s", args.session]
-    print(f"[drive_mount] {args.session or 'default session'} -> {args.path} ({args.mode} mode) ...")
+    print(f"[drive_mount] {args.session or 'default session'} ({cfg['colab_account']} -> "
+          f"drive:{cfg['drive_account']}) -> {args.path} ({args.mode} mode) ...")
     t0 = time.time()
-    proc = subprocess.run(cmd, capture_output=True, text=True)
+    sub_env = dict(os.environ, COLAB_ACCOUNT=cfg["colab_account"])
+    proc = subprocess.run(cmd, capture_output=True, text=True, env=sub_env)
     out = (proc.stdout or "") + (proc.stderr or "")
     clean = re_ansi(out)
     for line in clean.splitlines():
@@ -443,18 +490,23 @@ def _in_cli() -> bool:
     return bool(__package__) and __name__ != "__main__"
 
 
-def _consent_hint() -> str:
-    return "colab dfs consent" if _in_cli() else "python3 dfs_creds.py consent --flavor sdk"
+def _consent_hint(account: str | None = None) -> str:
+    if _in_cli():
+        prefix = f"colab -a {account} " if account and account != accounts.DEFAULT_ACCOUNT else "colab "
+        return f"{prefix}dfs consent"
+    acct_flag = f" --account {account}" if account else ""
+    return f"python3 dfs_creds.py consent{acct_flag} --flavor sdk"
 
 
 def make_cfg(session=None, path="/content/drive", mode="shim", force=False, readonly=False,
              timeout=120, port=8012, cli_token=False, from_env=False, drive_extra=(),
-             purge_state=False, user_id=None, email=None) -> dict:
+             purge_state=False, user_id=None, email=None, account=None, drive_account=None) -> dict:
     """Build the remote config without going through argparse (used by `colab dfs mount`)."""
     ns = argparse.Namespace(session=session, path=path, mode=mode, force=force,
                             readonly=readonly, timeout=timeout, port=port, cli_token=cli_token,
                             from_env=from_env, drive_extra=list(drive_extra),
                             purge_state=purge_state, user_id=user_id, email=email,
+                            account=account, drive_account=drive_account,
                             colab="colab", dry_run=True)
     return build_cfg(ns)
 

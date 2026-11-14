@@ -1,21 +1,36 @@
-# colab-dfs-ext — a zero-browser Drive mount extension for google-colab-cli
+# colab-dfs-ext — zero-browser Drive mount & multi-account extension for google-colab-cli
 
 > [中文](README.zh-CN.md) | English
 
-Exposes browser-less Google Drive mounting as a `dfs` subcommand group on the `colab` CLI —
+Adds **browser-less Google Drive mounting (`colab dfs`)**, **isolated multi-account profiles (`colab account`, `-a / --account`)**, and **extended AI-agent guidance (`colab skill`)** to the `colab` CLI —
 **without touching a single file of google-colab-cli**: colab-cli upgrades are unaffected,
-no re-integration is needed, and worst case a single command repairs it. This directory is a
-self-contained project that can be copied elsewhere and used standalone (pure Python standard
-library, no third-party dependencies).
+no re-integration is needed, and worst case a single command repairs it. All extension modules
+aside from `google-colab-cli` runtime integrations use pure Python standard library.
 
 ```
-colab dfs mount   [-s SESSION] [path]   # Zero-browser mount (DriveFS + in-runtime credentials shim)
-colab dfs umount  [-s SESSION] [path]
-colab dfs status  [-s SESSION] [path]
-colab dfs consent [--flavor dfs] [--minimal] ...   # One-time Google consent -> refresh token
-colab dfs show | token
-colab dfs doctor                        # Health check: injection / credentials / session, with fix hints
-colab dfs install                       # Re-inject this extension (run if `dfs` disappears after an upgrade)
+# Zero-browser Drive mounting
+colab dfs mount   [-a ACCT] [--drive-account DRV] [-s SESSION] [path]
+colab dfs umount  [-a ACCT] [-s SESSION] [path]
+colab dfs status  [-a ACCT] [--drive-account DRV] [-s SESSION] [path]
+colab dfs consent [-a ACCT] [--flavor dfs|sdk|custom] [--url-only | --code CODE]
+colab dfs show | token | clear [-a ACCT] [--drive-account DRV]
+colab dfs doctor  [-a ACCT]             # Health check: injection / accounts / credentials
+colab dfs install                       # Re-inject this extension if `dfs` disappears after upgrade
+
+# Multi-account management (`acct` is a hidden alias for `account`)
+colab -a <account> <any-colab-command>  # Target profile by name or email (or set COLAB_ACCOUNT)
+colab account list [--json]             # Offline inventory (never blocks on locked keyrings)
+colab account current [--json]          # Show currently resolved profile
+colab account add <name> [--email ...]  # Register + login (OAuth2 or --auth adc / --adc-file)
+colab account login [<name>] [--url-only | --code CODE]   # Interactive or headless PKCE login
+colab account use <name>                # Switch default active profile
+colab account status [--json]           # Parallel probe: CCU, burn rate, sessions, Drive across all
+colab account set-drive <storage> [-a <compute> | --default | --clear]  # Shared Drive binding
+colab account rename <old> <new>        # Rename profile & migrate isolated state/tokens
+colab account remove <name> [--force]   # Remove profile & isolated state
+colab sessions --all [--json]           # List active sessions across all accounts
+colab usage --all [--json]              # Check CCU quota across all accounts
+colab skill                             # Upstream SKILL.md augmented with dfs & multi-account docs
 ```
 
 Every subcommand accepts `-- -<any args>` to pass extra flags through to the underlying tools —
@@ -81,8 +96,9 @@ client, works headless but easily blocked by Google) and `--flavor custom --clie
 --client-secret ...` (your own GCP project — most robust long-term). On machines that have
 already consented once, `colab dfs consent --import` works with no browser at all.
 
-Credentials live in `~/.config/colab-cli/dfs_credentials.json`; every mount afterwards is
-zero-browser.
+DriveFS credentials live in `~/.config/colab-cli/accounts/<account>/dfs_credentials.json`
+(with automatic non-destructive adoption from legacy `~/.config/colab-cli/dfs_credentials.json` into
+`default`); every mount afterwards is zero-browser.
 
 ### Step 3 · Everyday mounting
 
@@ -97,13 +113,62 @@ colab dfs mount -s test --dry-run               # only print config and the remo
 colab dfs mount -s test --readonly              # read-only mount
 ```
 
-### Optional · Make the official `drivemount` zero-browser too
+### Multi-account workflows & shared Drive mounting
+
+Existing `~/.config/colab-cli/{sessions.json,history/,dfs_credentials.json}` and keyring
+`oauth_token` are automatically and **non-destructively** adopted into profile `default` on first
+use (the original files are preserved; rename anytime with `colab account rename default personal`).
+
+Each account has isolated state under `~/.config/colab-cli/accounts/<name>/`
+(`sessions.json`, `history/`, `dfs_credentials.json`, `dfs_pending.json`, `oauth_pending.json`,
+and `0o600` `oauth_token.json` fallback when keyring is unavailable/locked) plus keyring entry
+`oauth_token:<name>`, indexed in `~/.config/colab-cli/accounts.json`.
 
 ```bash
-export COLAB_DFS_DEFAULT=1     # put this in your shell profile
-colab drivemount -s test       # routed through the dfs extension; falls back to the official
-                               # browser flow automatically if credentials are missing
+# Add accounts interactively (runs Colab OAuth2 + DriveFS consent by default)
+colab account add work --email me@work.com
+colab account add gpu2 --no-dfs --drive-account work   # reuse work's Drive across compute accounts
+
+# Headless / SSH / agent two-step login (works for both Colab auth and DriveFS)
+colab account login work --url-only
+colab account login work --code <PASTED_CODE>
+colab -a work dfs consent --flavor sdk --url-only
+colab -a work dfs consent --code <PASTED_CODE>
+
+# Target accounts via flag, env var, active switch, or smart -s <session> routing
+colab -a work new -g T4 -s gpu-a             # creates session inside account `work`
+export COLAB_ACCOUNT=work                    # optional shell default override
+colab account use personal                   # switch persistent default account
+colab exec -s gpu-a -- nvidia-smi            # auto-routes -s gpu-a to `work` (notice on stderr)
+colab url -s gpu-a                           # injects authuser=<email> for browser convenience
+
+# Cross-account views & shared Drive
+colab account status                         # parallel probe: CCU + rate + sessions + Drive
+colab sessions --all [--json]                # sessions across all accounts
+colab usage --all [--json]                   # CCU quota across all accounts
+colab account set-drive main -a gpu2         # bind gpu2's Drive mounts to `main`
+colab -a gpu2 dfs mount -s gpu-a --drive-account main   # one-off override
 ```
+
+When running AI agents against `colab`, `colab skill` / `colab SKILL` automatically includes full
+`colab dfs` and `colab account` instructions (preserving valid YAML frontmatter).
+
+### Built-in `colab drivemount` enhanced by default
+
+`colab drivemount` is automatically upgraded to use the zero-browser DriveFS backend when
+credentials are present, supporting `-a/--account`, `--drive-account`, `--readonly`, `--force`,
+`--purge-state`, `--timeout`, `--dry-run`, and automatic session-owner routing:
+
+```bash
+colab drivemount -s test                             # zero-browser DriveFS + auto session routing
+colab drivemount -s test --drive-account storage     # mount another profile's Drive
+colab drivemount -s test --readonly --no-fallback    # fail fast if DriveFS credentials are missing
+colab drivemount -s test --upstream                  # force original interactive browser flow
+COLAB_DFS_DEFAULT=0 colab drivemount -s test         # disable zero-browser override via env var
+```
+
+When DriveFS credentials are missing (and no DriveFS-only flag or `--no-fallback` is given),
+`colab drivemount` falls back to the upstream interactive flow with an account reminder before the URL.
 
 ## Coexisting with upgrades (verified in practice)
 
@@ -135,8 +200,9 @@ COLAB_DFS_DEBUG=1 colab dfs …   # verbose diagnostics from the loader/injectio
 ## How the injection works (why upgrades don't break it)
 
 - colab-cli is a Typer app: `colab_cli.cli` exposes a module-level `app` object, and the official
-  command modules themselves follow the `register(app)` convention — the extension simply hangs
-  another `dfs` subgroup off that same `app`. **Zero intrusion.**
+  command modules themselves follow the `register(app)` convention — the extension wraps the
+  callback/auth/state hooks cleanly and registers the `account` (`acct`) and `dfs` subgroups on
+  that same `app`. **Zero intrusion.**
 - A `.pth` file is the only hook site.py executes automatically: one line,
   `import os, sys; exec(compile("try: ... import colab_dfs_loader ..."))`, which adds
   `~/.colab-dfs-ext` to `sys.path` and eagerly imports the loader; the loader calls
@@ -152,7 +218,8 @@ COLAB_DFS_DEBUG=1 colab dfs …   # verbose diagnostics from the loader/injectio
   files) and **must call `runtime.stop()` in a finally block** — otherwise the kernel client's
   non-daemon threads hang the `colab` process on exit (symptom seen in practice: all output
   printed but the command never returns).
-- Credentials are shared with the standalone tools: `~/.config/colab-cli/dfs_credentials.json`.
+- Per-account DriveFS credentials are stored in `~/.config/colab-cli/accounts/<account>/dfs_credentials.json`
+  (legacy `~/.config/colab-cli/dfs_credentials.json` is automatically adopted into `default` and kept intact).
 - For the underlying technical background (DriveFS's credentials contract, the metadata shim,
   the three de-browsering approaches), see the parent repo's
   `colab-drivemount-re/docs/REVERSE.md`.
@@ -160,13 +227,19 @@ COLAB_DFS_DEBUG=1 colab dfs …   # verbose diagnostics from the loader/injectio
 ## Layout
 
 ```
-extension/
+colab-dfs-ext/
 ├── install.sh               # curl | sh one-line bootstrap installer (POSIX sh)
 ├── install.py               # install / repair / uninstall / status (pure stdlib)
 ├── colab_dfs_loader.py      # loader imported by the .pth startup hook
+├── tests/
+│   └── test_multi_account.py # hermetic multi-account, DriveFS, and skill tests
 └── colab_dfs_ext/           # the extension itself (copied/symlinked to ~/.colab-dfs-ext/)
     ├── __init__.py          # register(app) entry point
     ├── inject.py            # .pth writing and state management
+    ├── accounts.py          # account registry, isolation paths, migration, keyring/file backend
+    ├── account_commands.py  # `colab account` subcommands (typer)
+    ├── cli_hooks.py         # global -a/--account, auth/state isolation, --all, skill hooks
+    ├── skill_doc.py         # augments `colab skill` / `colab SKILL` output dynamically
     ├── commands.py          # the `colab dfs` subcommands (typer)
     ├── dfs_creds.py         # OAuth consent / credential storage
     ├── drive_mount.py       # remote mount script (metadata shim + DriveFS)

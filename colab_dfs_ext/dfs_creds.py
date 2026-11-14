@@ -34,6 +34,7 @@ import sys
 import time
 import urllib.parse
 import urllib.request
+from typing import Optional
 
 # --------------------------------------------------------------------------------------
 # dependencies: fall back to the colab-cli uv tool venv, which ships google-auth + oauthlib
@@ -90,6 +91,14 @@ if _DEPS_OK:
 else:  # pragma: no cover
     Request = Credentials = InstalledAppFlow = None
 
+try:
+    from . import accounts  # type: ignore[no-redef]
+except ImportError:  # standalone execution outside the package
+    _ext_parent = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    if _ext_parent not in sys.path:
+        sys.path.insert(0, _ext_parent)
+    from colab_dfs_ext import accounts  # type: ignore[no-redef]
+
 # --------------------------------------------------------------------------------------
 
 STORE = os.path.expanduser("~/.config/colab-cli/dfs_credentials.json")
@@ -141,24 +150,42 @@ def _in_cli() -> bool:
     return bool(__package__) and __name__ != "__main__"
 
 
-def _mount_hint() -> str:
-    return "colab dfs mount -s <session>" if _in_cli() else "python3 drive_mount.py -s <session>"
+def _mount_hint(account: Optional[str] = None) -> str:
+    if _in_cli():
+        prefix = f"colab -a {account} " if account and account != accounts.DEFAULT_ACCOUNT else "colab "
+        return f"{prefix}dfs mount -s <session>"
+    acct_arg = f" -a {account}" if account else ""
+    return f"python3 drive_mount.py{acct_arg} -s <session>"
 
 
-def load() -> dict:
-    if not os.path.exists(STORE):
+def store_path(account: Optional[str] = None, *, drive_account: Optional[str] = None,
+               for_consent: bool = False, allow_create: bool = False) -> tuple[str, str, str]:
+    """Return `(path, colab_account, drive_account)` for DriveFS credentials."""
+    colab_acct, _ = accounts.resolve_account(account, allow_create=allow_create)
+    drv_acct, src = accounts.resolve_drive_account(
+        colab_acct, drive_account, for_consent=for_consent
+    )
+    return accounts.dfs_store_path(drv_acct), colab_acct, drv_acct
+
+
+def pending_path(account: Optional[str] = None, *, allow_create: bool = False) -> tuple[str, str]:
+    colab_acct, _ = accounts.resolve_account(account, allow_create=allow_create)
+    drv_acct, _ = accounts.resolve_drive_account(colab_acct, for_consent=True)
+    return accounts.dfs_pending_path(drv_acct), drv_acct
+
+
+def load(account: Optional[str] = None, *, drive_account: Optional[str] = None) -> dict:
+    path, _, _ = store_path(account=account, drive_account=drive_account, for_consent=False)
+    if not os.path.exists(path):
         return {}
-    with open(STORE) as f:
+    with open(path, encoding="utf-8") as f:
         return json.load(f)
 
 
-def save(data: dict) -> None:
-    os.makedirs(os.path.dirname(STORE), exist_ok=True)
-    tmp = STORE + ".tmp"
-    with open(tmp, "w") as f:
-        json.dump(data, f, indent=2)
-    os.chmod(tmp, 0o600)
-    os.replace(tmp, STORE)
+def save(data: dict, account: Optional[str] = None) -> str:
+    path, _, drv_acct = store_path(account=account, for_consent=True, allow_create=True)
+    accounts._atomic_write_json(path, data, mode=0o600)
+    return path
 
 
 def _sdk_client_config() -> dict:
@@ -236,25 +263,70 @@ def _flow_for(flavor: str, scopes: list[str], port: int, redirect_uri: str | Non
     return flow, DFS_CLIENT_ID, DFS_CLIENT_SECRET, DFS_TOKEN_URI
 
 
+def _record_dfs_account_meta(drive_acct: str, data: dict) -> None:
+    reg = accounts.load_registry()
+    meta = reg.get("accounts", {}).get(drive_acct, {})
+    existing_email = meta.get("email")
+    new_email = data.get("email")
+    if existing_email and new_email and existing_email.strip().lower() != new_email.strip().lower():
+        print(
+            f"[dfs] Warning: DriveFS authorized {new_email}, but account {drive_acct!r} "
+            f"has Colab email {existing_email}.",
+            file=sys.stderr,
+        )
+    updates: dict = {}
+    if new_email:
+        updates["dfs_email"] = new_email
+        if not existing_email:
+            updates["email"] = new_email
+    if data.get("user_id") and not meta.get("user_id"):
+        updates["user_id"] = data["user_id"]
+    if updates:
+        accounts.update_account_meta(drive_acct, **updates)
+
+
 def do_consent(args) -> None:
     scopes = DFS_SCOPES_MINIMAL if args.minimal else DFS_SCOPES
     if args.scopes:
         scopes = args.scopes.split()
-    flavor = "custom" if (args.client_id and args.flavor == "sdk") else args.flavor
+
+    acct_arg = getattr(args, "account", None)
+    pend_file, drv_acct = pending_path(account=acct_arg, allow_create=not bool(args.code))
+    reg = accounts.load_registry()
+    acct_meta = reg.get("accounts", {}).get(drv_acct, {})
+    hint = getattr(args, "login_hint", None) or args.email or acct_meta.get("email")
+
+    if args.flavor is None:
+        if args.client_id:
+            flavor = "custom"
+        elif args.url_only and not args.redirect_uri:
+            if _in_cli():
+                print(
+                    "[dfs] --url-only: using --flavor sdk (copy-paste code flow) instead of loopback dfs.",
+                    file=sys.stderr,
+                )
+            flavor = "sdk"
+        else:
+            flavor = "dfs" if _in_cli() else "sdk"
+    else:
+        flavor = "custom" if (args.client_id and args.flavor == "sdk") else args.flavor
+
     cid, csec, turi = (args.client_id or os.environ.get("COLAB_DRIVE_CLIENT_ID"),
                        args.client_secret or os.environ.get("COLAB_DRIVE_CLIENT_SECRET"),
                        args.token_uri or os.environ.get("COLAB_DRIVE_TOKEN_URI"))
 
     # ---- step 2 of the two-step (agent friendly) flow ---------------------------------
     if args.code:
-        if not os.path.exists(PENDING):
-            raise SystemExit(f"nothing to finish: {PENDING} missing; run --url-only first")
-        pend = json.load(open(PENDING))
+        if not os.path.exists(pend_file):
+            raise SystemExit(f"nothing to finish: {pend_file} missing; run --url-only first")
+        with open(pend_file, encoding="utf-8") as f:
+            pend = json.load(f)
         flow, client_id, client_secret, token_uri = _flow_for(
             pend["flavor"], pend["scopes"], pend.get("port", 8091), pend["redirect_uri"],
             pend.get("client_id"), pend.get("client_secret"), pend.get("token_uri"),
         )
         flow.oauth2state = pend.get("state")
+        flow.code_verifier = pend.get("code_verifier")
         flow.fetch_token(code=args.code)
         creds = flow.credentials
         flavor = pend["flavor"]
@@ -269,15 +341,26 @@ def do_consent(args) -> None:
                 kwargs["include_granted_scopes"] = "true"
             if flavor == "sdk":
                 kwargs["token_usage"] = "remote"
+            if hint:
+                kwargs["login_hint"] = hint
             auth_url, state = flow.authorization_url(**kwargs)
             save_pending({"flavor": flavor, "scopes": scopes, "state": state,
+                          "code_verifier": flow.code_verifier,
                           "redirect_uri": flow.redirect_uri, "port": args.port,
                           "client_id": client_id, "client_secret": client_secret,
                           "token_uri": token_uri,
-                          "created_at": time.strftime("%Y-%m-%dT%H:%M:%S%z")})
+                          "account": drv_acct,
+                          "created_at": time.strftime("%Y-%m-%dT%H:%M:%S%z")},
+                         account=drv_acct)
             print(auth_url)
+            if _in_cli():
+                acct_flag = f"-a {drv_acct} " if drv_acct != accounts.DEFAULT_ACCOUNT else ""
+                finish_cmd = f"colab {acct_flag}dfs consent --code <PASTED_CODE>"
+            else:
+                acct_flag = f" --account {drv_acct}" if drv_acct != accounts.DEFAULT_ACCOUNT else ""
+                finish_cmd = f"python3 {os.path.basename(__file__)} consent{acct_flag} --code <PASTED_CODE>"
             print(f"\n# open the URL, approve, then finish with:\n"
-                  f"#   python3 {os.path.basename(__file__)} consent --code <PASTED_CODE>",
+                  f"#   {finish_cmd}",
                   file=sys.stderr)
             return
 
@@ -289,6 +372,8 @@ def do_consent(args) -> None:
             extra = {"token_usage": "remote"} if flavor == "sdk" else {}
             if args.include_granted_scopes:
                 extra["include_granted_scopes"] = "true"
+            if hint:
+                extra["login_hint"] = hint
             auth_url, state = flow.authorization_url(prompt="consent", access_type="offline",
                                                      **extra)
             print("\n1) Open this URL in any browser (it only needs to hand back a code):\n")
@@ -305,17 +390,11 @@ def do_consent(args) -> None:
             flow, client_id, client_secret, token_uri = _flow_for(
                 flavor, scopes, args.port, args.redirect_uri, cid, csec, turi
             )
+            extra_loop = {"include_granted_scopes": "true"} if args.include_granted_scopes else {}
+            if hint:
+                extra_loop["login_hint"] = hint
             auth_url, state = flow.authorization_url(
-                prompt="consent", access_type="offline",
-                **({"include_granted_scopes": "true"} if args.include_granted_scopes else {}))
-            if args.url_only:
-                print(auth_url)
-                save_pending({"flavor": flavor, "scopes": scopes, "state": state,
-                              "redirect_uri": flow.redirect_uri, "port": args.port,
-                              "client_id": client_id, "client_secret": client_secret,
-                              "token_uri": token_uri,
-                              "created_at": time.strftime("%Y-%m-%dT%H:%M:%S%z")})
-                return
+                prompt="consent", access_type="offline", **extra_loop)
             code = _wait_for_code_on_loopback(
                 flow, args.port, auth_url,
                 timeout=args.consent_timeout, open_browser=not args.no_browser)
@@ -346,17 +425,17 @@ def do_consent(args) -> None:
         data["email"] = args.email or os.environ.get("COLAB_DRIVE_EMAIL")
     if not data.get("user_id"):
         print("  set it with --user-id <GaiaId> (or env COLAB_DRIVE_USER_ID)")
-    save(data)
-    print(f"saved -> {STORE}\nNow: {_mount_hint()}")
+    saved_path = save(data, account=drv_acct)
+    _record_dfs_account_meta(drv_acct, data)
+    if args.code and os.path.exists(pend_file):
+        os.remove(pend_file)
+    print(f"saved [{drv_acct}] -> {saved_path}\nNow: {_mount_hint(drv_acct)}")
 
 
-def save_pending(data: dict) -> None:
-    os.makedirs(os.path.dirname(PENDING), exist_ok=True)
-    tmp = PENDING + ".tmp"
-    with open(tmp, "w") as f:
-        json.dump(data, f, indent=2)
-    os.chmod(tmp, 0o600)
-    os.replace(tmp, PENDING)
+def save_pending(data: dict, account: Optional[str] = None) -> str:
+    path, _ = pending_path(account=account, allow_create=True)
+    accounts._atomic_write_json(path, data, mode=0o600)
+    return path
 
 
 def do_import(args) -> None:
@@ -365,6 +444,8 @@ def do_import(args) -> None:
     Needs the refresh token + the client it was minted for; optionally validates it by
     refreshing once and recording user_id/email.
     """
+    acct_arg = getattr(args, "account", None)
+    _, _, drv_acct = store_path(account=acct_arg, for_consent=True, allow_create=True)
     rt = args.refresh_token or os.environ.get("COLAB_DRIVE_REFRESH_TOKEN")
     cid = args.client_id or os.environ.get("COLAB_DRIVE_CLIENT_ID")
     csec = args.client_secret or os.environ.get("COLAB_DRIVE_CLIENT_SECRET") or ""
@@ -389,8 +470,9 @@ def do_import(args) -> None:
     except Exception as exc:  # noqa: BLE001
         print(f"refresh token OK but userinfo failed ({exc}); "
               "set COLAB_DRIVE_USER_ID or pass --user-id")
-    save(data)
-    print(f"saved -> {STORE}")
+    saved_path = save(data, account=drv_acct)
+    _record_dfs_account_meta(drv_acct, data)
+    print(f"saved [{drv_acct}] -> {saved_path}")
 
 
 def _pick_port(pref: int) -> int:
@@ -473,15 +555,20 @@ def current_access_token(data: dict) -> tuple[str, int]:
 
 
 def do_token(args) -> None:
-    data = load()
+    acct_arg = getattr(args, "account", None)
+    drv_override = getattr(args, "drive_account", None)
+    path, _, drv_acct = store_path(account=acct_arg, drive_account=drv_override, for_consent=False)
+    data = load(account=acct_arg, drive_account=drv_override)
     if not data.get("refresh_token"):
-        raise SystemExit(f"no refresh token in {STORE}; run `consent` first")
+        raise SystemExit(f"no refresh token in {path}; run `consent` first")
     tok, exp = current_access_token(data)
     if args.whoami:
         info = _userinfo(tok)
         data["user_id"], data["email"] = info.get("sub"), info.get("email")
-        save(data)
+        save(data, account=drv_acct)
+        _record_dfs_account_meta(drv_acct, data)
     out = {
+        "account": drv_acct,
         "access_token": tok,
         "expires_in": max(60, exp),
         "token_type": "Bearer",
@@ -492,21 +579,35 @@ def do_token(args) -> None:
     print(json.dumps(out, indent=2) if args.json is None else json.dumps(out))
 
 
-def do_show(_args) -> None:
-    data = load()
+def do_show(args) -> None:
+    acct_arg = getattr(args, "account", None)
+    drv_override = getattr(args, "drive_account", None)
+    path, colab_acct, drv_acct = store_path(
+        account=acct_arg, drive_account=drv_override, for_consent=False
+    )
+    data = load(account=acct_arg, drive_account=drv_override)
     if not data:
-        print(f"{STORE}: empty (run `consent`)")
+        print(f"[{drv_acct}] {path}: empty (run `consent`)")
         return
-    red = {k: ("<set>" if k in ("refresh_token", "client_secret") and v else v)
-           for k, v in data.items()}
+    red = {
+        "account": colab_acct,
+        "drive_account": drv_acct,
+        "store": path,
+        **{k: ("<set>" if k in ("refresh_token", "client_secret") and v else v)
+           for k, v in data.items()},
+    }
     print(json.dumps(red, indent=2))
 
 
-def do_clear(_args) -> None:
-    if os.path.exists(STORE):
-        os.remove(STORE)
-        print(f"removed {STORE} (remember to revoke the grant on "
+def do_clear(args) -> None:
+    acct_arg = getattr(args, "account", None)
+    path, _, drv_acct = store_path(account=acct_arg, for_consent=True)
+    if os.path.exists(path):
+        os.remove(path)
+        print(f"removed [{drv_acct}] {path} (remember to revoke the grant on "
               "https://myaccount.google.com/permissions)")
+    else:
+        print(f"[{drv_acct}] {path}: nothing to remove")
 
 
 def main(argv=None) -> None:
@@ -514,8 +615,9 @@ def main(argv=None) -> None:
     sub = ap.add_subparsers(dest="cmd", required=True)
 
     c = sub.add_parser("consent", help="one-time browser consent for the DriveFS scopes")
-    c.add_argument("--flavor", choices=["sdk", "dfs", "custom"], default="sdk",
-                   help="sdk = colab-cli cloud client + copy-paste code (default, works headless);"
+    c.add_argument("-a", "--account", help="account profile name or email")
+    c.add_argument("--flavor", choices=["sdk", "dfs", "custom"], default=None,
+                   help="sdk = colab-cli cloud client + copy-paste code (works headless);"
                         " dfs = client baked into /opt/google/drive/drive (needs localhost);"
                         " custom = your own OAuth client (see --client-id)")
     c.add_argument("--client-id", help="your own OAuth client id (implies --flavor custom)")
@@ -535,6 +637,7 @@ def main(argv=None) -> None:
                         "flexible-api, which Google cannot render -> 400 invalid_scope")
     c.add_argument("--user-id", help="account GaiaId, if userinfo cannot supply it")
     c.add_argument("--email", help="account email, if userinfo cannot supply it")
+    c.add_argument("--login-hint", help="Google login_hint email pre-selected in browser")
     c.add_argument("--consent-timeout", type=int, default=300,
                    help="seconds to wait for the loopback redirect")
     c.add_argument("--url-only", action="store_true",
@@ -543,11 +646,14 @@ def main(argv=None) -> None:
     c.set_defaults(func=do_consent)
 
     t = sub.add_parser("token", help="print a fresh access token as JSON")
+    t.add_argument("-a", "--account", help="account profile name or email")
+    t.add_argument("--drive-account", help="storage account supplying Drive credentials")
     t.add_argument("--whoami", action="store_true", help="also refresh/record user_id + email")
     t.add_argument("--json", nargs="?", const="", default=None, help=argparse.SUPPRESS)
     t.set_defaults(func=do_token)
 
     i = sub.add_parser("import", help="store an existing refresh token (no browser at all)")
+    i.add_argument("-a", "--account", help="account profile name or email")
     i.add_argument("--refresh-token", help="or env COLAB_DRIVE_REFRESH_TOKEN")
     i.add_argument("--client-id", help="or env COLAB_DRIVE_CLIENT_ID")
     i.add_argument("--client-secret", help="or env COLAB_DRIVE_CLIENT_SECRET")
@@ -556,9 +662,14 @@ def main(argv=None) -> None:
     i.add_argument("--flavor", default="imported", help="free-form label for `show`")
     i.set_defaults(func=do_import)
 
-    sub.add_parser("show", help="show the stored credential (secrets redacted)").set_defaults(
-        func=do_show)
-    sub.add_parser("clear", help="delete the stored credential").set_defaults(func=do_clear)
+    s = sub.add_parser("show", help="show the stored credential (secrets redacted)")
+    s.add_argument("-a", "--account", help="account profile name or email")
+    s.add_argument("--drive-account", help="storage account supplying Drive credentials")
+    s.set_defaults(func=do_show)
+
+    cl = sub.add_parser("clear", help="delete the stored credential")
+    cl.add_argument("-a", "--account", help="account profile name or email")
+    cl.set_defaults(func=do_clear)
 
     args = ap.parse_args(argv)
     args.func(args)
